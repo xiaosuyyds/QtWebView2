@@ -11,14 +11,12 @@ description = "A lightweight and powerful WebView2 widget for Python Qt (PySide/
 readme = "README.md"
 version = "0.1.0"
 requires-python = ">=3.8"
-license = { file = "LICENSE" }
+license = "MPL-2.0"
+license-files = ["LICENSE"]
 keywords = ["qt", "qtpy", "pyqt", "pyside", "web", "webview", "webview2"]
 classifiers = [
     # Development Status
     "Development Status :: 4 - Beta", # Beta is perfect for a 0.x.y release
-
-    # License
-    "License :: OSI Approved :: Mozilla Public License 2.0 (MPL 2.0)",
 
     # Supported Python Versions
     "Programming Language :: Python :: 3",
