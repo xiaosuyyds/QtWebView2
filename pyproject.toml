@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=65.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qtwebview2"
+authors = [
+  { name="校溯", email="xiaosu-1009@qq.com" }
+]
+description = "QtWebView2 is a Qt WebView2 wrapper for Python, which is based on QtPy and Python.NET."
+readme = "README.md"
+version = "0.1.0"
+requires-python = ">=3.8"
+license = { file = "LICENSE" }
+keywords = ["qt", "qtpy", "pyqt", "pyside", "web", "webview", "webview2"]
+classifiers = [
+    # Development Status
+    "Development Status :: 4 - Beta", # Beta is perfect for a 0.x.y release
+
+    # License
+    "License :: OSI Approved :: Mozilla Public License 2.0 (MPL 2.0)",
+
+    # Supported Python Versions
+    "Programming Language :: Python :: 3",
+
+    # Operating System
+    "Operating System :: Microsoft :: Windows",
+
+    # Intended Audience & Topic
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Software Development :: User Interfaces",
+
+    # Framework
+    "Framework :: Qt",
+]
+dependencies = [
+    "pywin32>=300",
+    "qtpy>=2.0.0",
+    "pythonnet>=3.0.0"
+]
+
+[project.urls]
+Homepage = "https://github.com/xiaosuyyds/QtWebView2"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.package-data]
+qtwebview2 = ["lib/**/*.md", "lib/**/*.dll"]
