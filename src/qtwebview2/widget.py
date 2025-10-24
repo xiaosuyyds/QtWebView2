@@ -72,7 +72,7 @@ JSONSerializable = Union[dict[str, "JSONSerializable"], list["JSONSerializable"]
 
 @typing.runtime_checkable
 class QtWebView2JsBridge(typing.Protocol):
-    def __call__(self, name, *arg) -> Union[JSONSerializable, Callable[[Callable[[JSONSerializable], ...], ...], ...]]:
+    def __call__(self, name, *arg) -> Union[JSONSerializable, Callable[[Callable[[JSONSerializable], Any], Any], Any]]:
         ...
 
 
@@ -80,7 +80,7 @@ class DictJsBridge:
     def __init__(self, js_apis: Optional[dict[str, Callable[..., JSONSerializable]]] = None):
         self.js_apis = js_apis if js_apis is not None else {}
 
-    def __call__(self, name, *arg) -> Union[JSONSerializable, Callable[[Callable[[JSONSerializable], ...], ...], ...]]:
+    def __call__(self, name, *arg) -> Union[JSONSerializable, Callable[[Callable[[JSONSerializable], Any], Any], Any]]:
         if name in self.js_apis:
             # For asynchronous functions, return the function itself
             if hasattr(self.js_apis[name], 'async_func'):
