@@ -7,7 +7,7 @@ name = "qtwebview2"
 authors = [
   { name="校溯", email="xiaosu-1009@qq.com" }
 ]
-description = "QtWebView2 is a Qt WebView2 wrapper for Python, which is based on QtPy and Python.NET."
+description = "A lightweight and powerful WebView2 widget for Python Qt (PySide/PyQt) with a seamless JS bridge."
 readme = "README.md"
 version = "0.1.0"
 requires-python = ">=3.8"
@@ -22,6 +22,13 @@ classifiers = [
 
     # Supported Python Versions
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
 
     # Operating System
     "Operating System :: Microsoft :: Windows",
@@ -47,4 +54,4 @@ Homepage = "https://github.com/xiaosuyyds/QtWebView2"
 package-dir = { "" = "src" }
 
 [tool.setuptools.package-data]
-qtwebview2 = ["lib/**/*.md", "lib/**/*.dll"]
+qtwebview2 = ["lib/**/*.md", "lib/**/*.dll", "*.md"]

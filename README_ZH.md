@@ -1,5 +1,12 @@
 # QtWebView2
 
+<div align="center">
+<img src="https://img.shields.io/pypi/v/qtwebview2" alt="PyPI version">
+<img src="https://img.shields.io/pypi/l/qtwebview2" alt="License">
+<img src="https://img.shields.io/pypi/pyversions/qtwebview2" alt="Python versions">
+<img src="https://img.shields.io/pypi/dm/qtwebview2" alt="Downloads">
+</div>
+
 | [English](https://github.com/xiaosuyyds/QtWebView2/blob/master/README.md) | 简体中文 |
 
 ## 📖 介绍
