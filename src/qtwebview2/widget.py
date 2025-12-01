@@ -7,6 +7,7 @@ import os
 import typing
 import uuid
 import webbrowser
+import concurrent.futures
 from typing import Callable, Any, Optional, Union
 
 import win32con
@@ -25,17 +26,15 @@ try:
     clr.AddReference('System')
     clr.AddReference('System.IO')
     clr.AddReference('System.Drawing')
-    clr.AddReference('System.Threading.Tasks')
-    from System import Uri, String, Action, Func, Type, EventHandler
+    from System import Uri
     from System.Drawing import Color as DotNetColor, ColorTranslator
-    from System.Threading.Tasks import Task
     from System.IO import Path as DotNetPath
 
     # Add .NET library references required by WebView2
     clr.AddReference(get_absolute_path('lib/Microsoft.Web.WebView2.WinForms'))
     clr.AddReference(get_absolute_path('lib/Microsoft.Web.WebView2.Core'))
     from Microsoft.Web.WebView2.Core import CoreWebView2InitializationCompletedEventArgs, \
-        CoreWebView2WebMessageReceivedEventArgs
+        CoreWebView2WebMessageReceivedEventArgs, CoreWebView2WebResourceContext
     from Microsoft.Web.WebView2.WinForms import WebView2, CoreWebView2CreationProperties
 
 except Exception as e:
@@ -53,6 +52,8 @@ except Exception as e:
         user_message=user_msg,
         download_url="https://go.microsoft.com/fwlink/p/?LinkId=2124703"
     ) from e
+
+from .wsgi_server import WebView2WSGIServer, PythonGeneratorStream, extract_request_data
 
 
 class QtWebView2ApiBridge(QObject):
@@ -104,10 +105,11 @@ class QtWebView2Widget(QWidget):
     QtPy WebView2 Widget
     """
 
+    _wsgi_response_ready = Signal(object, object, str, list, object)
+
     def __init__(
             self,
             url: Optional[str] = None,
-            parent: Optional[QWidget] = None,
             user_agent: Optional[str] = None,
             debug: bool = False,
             context_menus: bool = False,
@@ -118,6 +120,10 @@ class QtWebView2Widget(QWidget):
             js_apis: Union[dict[str, Callable[..., Any]], QtWebView2JsBridge, None] = None,
             user_data_folder: Optional[str] = None,
             no_local_storage: bool = False,
+            wsgi_app: Optional[Callable[..., Any]] = None,
+            wsgi_host_name: Optional[str] = None,
+            wsgi_executor: Union[concurrent.futures.Executor, int] = 8,
+            parent: Optional[QWidget] = None,
     ):
         """
         QtPy WebView2 Widget
@@ -133,10 +139,18 @@ class QtWebView2Widget(QWidget):
          default browser
         :param lazyload: Whether to lazy load. Enabled by default. If enabled, webview2 will only be loaded when the
          widget becomes visible for the first time.
-        :param js_apis: JS API, can be a dictionary or a class conforming to the QtWebView2JsBridge protocol.
-         A dictionary will be automatically converted to DictJsBridge. If not provided, an empty DictJsBridge is created.
+        :param js_apis: JS API, can be a dictionary or a class conforming to the QtWebView2JsBridge protocol. A
+         dictionary will be automatically converted to DictJsBridge. If not provided, an empty DictJsBridge is created.
         :param user_data_folder: User data directory. If not provided, it will be generated automatically.
         :param no_local_storage: Whether to disable local storage. Note: Disabling it may affect performance.
+        :param wsgi_app: If provided, the network request from WebView2 will be intercepted and handed over to the
+         provided WSGI App for processing
+        :param wsgi_host_name: If provided, only requests that meet the wsgi_host_name will be handed over to the
+         WSGI App for processing
+        :param wsgi_executor: If provided a thread pool executor,
+         the WSGI App will be executed in the provided executor.
+         If provided a number, the WSGI App will be executed in a thread pool executor
+         with the specified number of threads. defaults to 8
         :param parent: Parent widget
         """
         super().__init__(parent)
@@ -151,6 +165,21 @@ class QtWebView2Widget(QWidget):
             self.js_api: QtWebView2JsBridge = js_apis
         else:
             raise TypeError("The js_apis parameter must be a dictionary or a QtWebView2JsBridge compatible object")
+
+        self.wsgi_app = wsgi_app
+        self.wsgi_host_name = wsgi_host_name or "qtwebview2.local"
+        self._wsgi_server: Optional[WebView2WSGIServer] = None
+        if isinstance(wsgi_executor, int):
+            self._wsgi_executor = concurrent.futures.ThreadPoolExecutor(max_workers=wsgi_executor)
+        elif isinstance(wsgi_executor, concurrent.futures.Executor):
+            self._wsgi_executor = wsgi_executor
+        else:
+            raise TypeError("The wsgi_executor parameter must be a thread pool executor or an integer")
+
+        self._wsgi_response_ready.connect(self._finalize_wsgi_response)
+
+        if self.wsgi_app and not self.wsgi_host_name:
+            raise ValueError("wsgi_host_name must be provided when wsgi_app is set.")
 
         self.is_ready = False
         self._user_agent = user_agent
@@ -289,6 +318,17 @@ class QtWebView2Widget(QWidget):
 
         self._webview.CoreWebView2.DOMContentLoaded += lambda sender, args: self.bridge.domContentLoaded.emit()
 
+        if self.wsgi_app:
+            logger.info(f"WSGI application detected. Intercepting requests for host: {self.wsgi_host_name}")
+            self._wsgi_server = WebView2WSGIServer(self.wsgi_app)
+
+            self._webview.CoreWebView2.AddWebResourceRequestedFilter(f"http://{self.wsgi_host_name}/*",
+                                                                     CoreWebView2WebResourceContext.All)
+            self._webview.CoreWebView2.AddWebResourceRequestedFilter(f"https://{self.wsgi_host_name}/*",
+                                                                     CoreWebView2WebResourceContext.All)
+
+            self._webview.CoreWebView2.WebResourceRequested += self._on_web_resource_requested
+
         win32gui.ShowWindow(self._webview_hwnd, win32con.SW_SHOW)
 
         self._resize_webview()
@@ -299,6 +339,64 @@ class QtWebView2Widget(QWidget):
         for method_name, args, kwargs in self._pending_calls:
             getattr(self, method_name)(*args, **kwargs)
         self._pending_calls.clear()
+
+    def _on_web_resource_requested(self, sender, args):
+        try:
+            deferral = args.GetDeferral()
+            req_data = extract_request_data(args)
+            self._wsgi_executor.submit(self._run_wsgi_in_background, args, deferral, req_data)
+
+        except Exception as e:
+            logger.error(f"Error preparing WSGI request: {e}", exc_info=True)
+            pass
+
+    def _run_wsgi_in_background(self, args, deferral, req_data):
+        try:
+            status, headers, iterator = self._wsgi_server.process_wsgi_request(req_data)
+            self._wsgi_response_ready.emit(args, deferral, status, headers, iterator)
+        except Exception as e:
+            logger.error(f"Error in WSGI worker thread: {e}", exc_info=True)
+            self._wsgi_response_ready.emit(args, deferral, "500 Internal Server Error", [], None)
+
+    @Slot(object, object, str, list, object)
+    def _finalize_wsgi_response(self, args, deferral, status, headers, iterator):
+        try:
+            if not status or status.startswith('500') or iterator is None:
+                reason_phrase = "Internal Server Error"
+                status_code = 500
+                content_stream = None
+            else:
+                parts = status.split(' ', 1)
+                status_code = int(parts[0])
+                reason_phrase = parts[1] if len(parts) > 1 else "OK"
+
+                content_stream = PythonGeneratorStream(iterator)
+
+            env = self._webview.CoreWebView2.Environment
+            response = env.CreateWebResourceResponse(
+                content_stream,
+                status_code,
+                reason_phrase,
+                ""
+            )
+
+            if headers:
+                for name, value in headers:
+                    try:
+                        response.Headers.AppendHeader(name, value)
+                    except Exception:
+                        pass
+
+            args.Response = response
+
+        except Exception as e:
+            logger.error(f"Error finalizing WSGI response: {e}", exc_info=True)
+        finally:
+            if deferral:
+                try:
+                    deferral.Complete()
+                except Exception as e:
+                    logger.warning(f"Failed to complete deferral (page might be closed): {e}")
 
     def _on_new_window_request(self, sender, args):
         uri_string = args.Uri
@@ -420,9 +518,17 @@ class QtWebView2Widget(QWidget):
     def closeEvent(self, event):
         if self._webview:
             self._webview.Dispose()
+        self._wsgi_executor.shutdown(wait=False)
         super().closeEvent(event)
 
     # --- Public API Methods ---
+    def reload(self):
+        """Reloads the current page."""
+        if self.is_ready:
+            self._webview.Reload()
+        else:
+            self._pending_calls.append(('reload', (), {}))
+
     def load_url(self, url: str):
         """Loads a URL."""
         if self.is_ready:
