@@ -21,9 +21,20 @@ Python.NET 构建。
 - 🎸 **轻量级集成**: 通过 Python.NET 直接包装原生的 WebView2 控件，与 `QWebEngineView` 等方案相比，只会少量增加您应用程序的打包体积。
 - 🎻 **强大的 JS 桥**: 提供了一个健壮的 JS 桥接方案，使用 `Promise` 和 `async/await` 等现代 JS 特性，以实现 Python 和
   JavaScript 之间的无缝双向通信。
-- 🎷 **线程安全**: 大部分 API 调用都经过精心设计，通过利用 Qt 的信号和槽机制来确保线程安全，保证在多线程环境下的稳定性和安全性。
+- 🎷 **WSGI兼容**: 允许直接将WSGI返回的内容传递给 WebView2，让资源传递或是编写都更加轻松。
 - 🎺 **开箱即用**: 提供了丰富的配置选项和稳健的错误处理，让您可以用最少的配置快速上手。
 - 🎼 **QtPy 支持**: 基于 QtPy 构建，使其同时兼容 PyQt6 和 PySide6。
+
+## 🤔 快速对比
+
+| 特性         |     QtWebView2 (本项目)      |      `pywebview`      |    `QWebEngineView` (Qt)    |
+|:-----------|:-------------------------:|:---------------------:|:---------------------------:|
+| **Qt 集成度** |      **原生级 (布局与事件)**      |   **伪嵌入 (焦点/事件问题)**   |         **真·原生控件**          |
+| **渲染方式**   |     基于 HWND (存在空域问题)      |   基于 HWND (存在空域问题)    |       完全成分合成 (无空域问题)        |
+| **跨平台性**   |      ❌ (仅限 Windows)       | ✅ (Win, macOS, Linux) |    ✅ (Win, macOS, Linux)    |
+| **包体积增加**  |          **最小**           |     较小，但需手动开发中间层      |           **巨大**            |
+| **后端架构模式** |    **无端口 WSGI** / JS 桥    |  本地 HTTP 服务器 / JS 桥   | `QWebChannel` / 本地 HTTP 服务器 |
+| **最适用场景**  | **注重无缝交互的轻量级 Windows 应用** |    简单的、窗口独立的跨平台应用     |       视觉效果复杂的大型 Qt 应用       |
 
 ## ⬇️ 安装
 
@@ -59,7 +70,7 @@ QCoreApplication.setApplicationName("QtWebView2-Demo")
 # 1. 初始化应用和窗口
 app = QApplication(sys.argv)
 window = QWidget()
-window.setWindowTitle("QtWebView2 - JS Bridge Demo")
+window.setWindowTitle("QtWebView2-Demo")
 window.setGeometry(100, 100, 800, 600)
 layout = QVBoxLayout(window)
 
@@ -124,6 +135,169 @@ webview.bridge.domContentLoaded.connect(on_dom_loaded)
 
 window.show()
 sys.exit(app.exec())
+```
+
+一个 WSGI 示例（需要Flask）：
+
+```python
+import sys
+import random
+from datetime import datetime
+
+from flask import Flask, jsonify, render_template_string
+
+from qtpy.QtWidgets import QApplication, QVBoxLayout, QHBoxLayout, QWidget, QLabel, QPushButton, QFrame
+from qtpy.QtCore import Qt
+from qtwebview2 import QtWebView2Widget
+
+
+flask_app = Flask(__name__)
+
+VIRTUAL_HOST = "myapp.local"
+
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        body { 
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            padding: 0; margin: 0; 
+            background: #f5f7fa; color: #2c3e50; 
+            display: flex; justify-content: center; align-items: center; height: 100vh;
+        }
+        .container { 
+            background: white; width: 80%; max-width: 600px;
+            padding: 40px; border-radius: 12px; 
+            box-shadow: 0 4px 20px rgba(0,0,0,0.08); 
+            text-align: center;
+        }
+        h1 { margin-top: 0; color: #34495e; }
+        .tag { 
+            background: #e1f5fe; color: #0288d1; 
+            padding: 4px 8px; border-radius: 4px; font-size: 0.9em; font-weight: bold;
+        }
+        button { 
+            padding: 12px 24px; background: #00c853; color: white; 
+            border: none; border-radius: 6px; cursor: pointer; font-size: 16px;
+            transition: background 0.2s;
+        }
+        button:hover { background: #00e676; }
+        #result-box {
+            margin-top: 20px; padding: 15px; background: #263238; color: #80cbc4;
+            border-radius: 6px; font-family: monospace; text-align: left; min-height: 60px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🐍 Flask + 🖥️ WebView2</h1>
+        <p>This is a running in Qt memory <span class="tag">WSGI App</span></p>
+        <p>Server Time: <strong>{{ time }}</strong></p>
+
+        <div style="margin: 30px 0;">
+            <button onclick="fetchData()">⚡ Initiate a fetch request</button>
+        </div>
+
+        <div id="result-box">// Click the button to get the JSON data...</div>
+    </div>
+
+    <script>
+        async function fetchData() {
+            const box = document.getElementById('result-box');
+            box.textContent = "// Loading...";
+            try {
+                const res = await fetch('/api/random', {method: 'POST'});
+                const data = await res.json();
+                box.textContent = JSON.stringify(data, null, 2);
+            } catch(e) {
+                box.textContent = "Error: " + e;
+            }
+        }
+    </script>
+</body>
+</html>
+"""
+
+
+@flask_app.route('/')
+def index():
+    return render_template_string(HTML_TEMPLATE, time=datetime.now().strftime("%H:%M:%S"))
+
+
+@flask_app.route('/api/random', methods=['POST'])
+def api_random():
+    return jsonify({
+        "value": random.randint(1000, 9999),
+        "source": "Internal Flask Backend",
+        "status": "success"
+    })
+
+
+class MainWindow(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("QtWebView2 WSGI Demo")
+        self.resize(1000, 700)
+
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
+
+        self.top_bar = QFrame()
+        self.top_bar.setFixedHeight(50)
+        self.top_bar.setStyleSheet("""
+            QFrame { background-color: #ffffff; border-bottom: 1px solid #e0e0e0; }
+            QLabel { color: #333; font-size: 14px; font-weight: bold; }
+            QPushButton {
+                background-color: transparent; border: 1px solid #ccc; border-radius: 4px;
+                padding: 5px 15px; color: #555;
+            }
+            QPushButton:hover { background-color: #f0f0f0; color: #000; }
+        """)
+
+        bar_layout = QHBoxLayout(self.top_bar)
+        bar_layout.setContentsMargins(15, 0, 15, 0)
+
+        title_label = QLabel("🚀 QtWebView2 Demo")
+
+        self.status_label = QLabel("🟢 WSGI Server Running")
+        self.status_label.setStyleSheet("color: #4caf50; font-size: 12px; font-weight: normal;")
+
+        refresh_btn = QPushButton("Reload")
+        refresh_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        refresh_btn.clicked.connect(self.reload_webview)
+
+        bar_layout.addWidget(title_label)
+        bar_layout.addSpacing(20)
+        bar_layout.addWidget(self.status_label)
+        bar_layout.addStretch()
+        bar_layout.addWidget(refresh_btn)
+
+        self.webview = QtWebView2Widget(
+            parent=self,
+            wsgi_app=flask_app,
+            wsgi_host_name=VIRTUAL_HOST,
+            debug=True,
+            url=f"http://{VIRTUAL_HOST}/"
+        )
+
+        main_layout.addWidget(self.top_bar)
+
+        main_layout.addWidget(self.webview, 1)
+
+    def reload_webview(self):
+        self.webview.reload()
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec())
 ```
 
 ## 许可证
