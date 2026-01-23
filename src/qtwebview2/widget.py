@@ -66,6 +66,7 @@ class QtWebView2ApiBridge(QObject):
     async_result_ready = Signal(dict, str)  # Parameters: result, call_id
     execute_js_from_thread = Signal(str)  # Parameters: js_code
     domContentLoaded = Signal()
+    fullscreen_changed = Signal(bool)  # Parameters: is_fullscreen
 
 
 JSONSerializable = Union[dict[str, "JSONSerializable"], list["JSONSerializable"], str, int, float, bool, None]
@@ -123,6 +124,8 @@ class QtWebView2Widget(QWidget):
             wsgi_app: Optional[Callable[..., Any]] = None,
             wsgi_host_name: Optional[str] = None,
             wsgi_executor: Union[concurrent.futures.Executor, int] = 8,
+            init_settings_hook: Optional[Callable[[Any], None]] = None,
+            fullscreen_support: bool = True,
             parent: Optional[QWidget] = None,
     ):
         """
@@ -130,27 +133,31 @@ class QtWebView2Widget(QWidget):
         :param url: The target URL
         :param user_agent: User-Agent string for the request header, defaults if left empty
         :param debug: Whether to enable debug mode. Disabling it will turn off hotkeys and dev tools. If disabled, it's
-         recommended to also disable context_menus.
+          recommended to also disable context_menus.
         :param context_menus: Whether to enable the right-click context menu
         :param transparent: Whether to use transparent mode (this has a bug when switching pages; remember to set th
-        e body's background color style to transparent for it to work)
+          e body's background color style to transparent for it to work)
         :param background_color: Background color, conflicts with transparent
         :param handle_new_window: Whether to handle new windows. If enabled, the target URL will be opened in the user's
-         default browser
+          default browser
         :param lazyload: Whether to lazy load. Enabled by default. If enabled, webview2 will only be loaded when the
-         widget becomes visible for the first time.
+          widget becomes visible for the first time.
         :param js_apis: JS API, can be a dictionary or a class conforming to the QtWebView2JsBridge protocol. A
-         dictionary will be automatically converted to DictJsBridge. If not provided, an empty DictJsBridge is created.
+          dictionary will be automatically converted to DictJsBridge. If not provided, an empty DictJsBridge is created.
         :param user_data_folder: User data directory. If not provided, it will be generated automatically.
         :param no_local_storage: Whether to disable local storage. Note: Disabling it may affect performance.
         :param wsgi_app: If provided, the network request from WebView2 will be intercepted and handed over to the
-         provided WSGI App for processing
+          provided WSGI App for processing
         :param wsgi_host_name: If provided, only requests that meet the wsgi_host_name will be handed over to the
-         WSGI App for processing
+          WSGI App for processing
         :param wsgi_executor: If provided a thread pool executor,
-         the WSGI App will be executed in the provided executor.
-         If provided a number, the WSGI App will be executed in a thread pool executor
-         with the specified number of threads. defaults to 8
+          the WSGI App will be executed in the provided executor.
+          If provided a number, the WSGI App will be executed in a thread pool executor
+          with the specified number of threads. defaults to 8
+        :param init_settings_hook: A callback function that takes 'CoreWebView2' as an argument.
+          Executed before loading the URL but after initialization.
+        :param fullscreen_support: If True, automatically handles window fullscreen toggling when
+          the web element requests fullscreen.
         :param parent: Parent widget
         """
         super().__init__(parent)
@@ -190,11 +197,14 @@ class QtWebView2Widget(QWidget):
         self._handle_new_window = handle_new_window
         self._user_data_folder = user_data_folder
         self._no_local_storage = no_local_storage
+        self._init_settings_hook = init_settings_hook
+        self._fullscreen_support = fullscreen_support
 
         # --- Internal State ---
         self._webview: Optional[WebView2] = None
         self._webview_hwnd: Optional[int] = None
         self._js_callbacks: dict[str, Callable[..., Any]] = {}
+        self._saved_window_state = None
 
         # Thread-safe signal bridge
         self.bridge = QtWebView2ApiBridge(self)
@@ -203,6 +213,9 @@ class QtWebView2Widget(QWidget):
         self.bridge.js_evaluation_result.connect(self._on_js_evaluation_result)
         self.bridge.async_result_ready.connect(self._return_result_to_js)
         self.bridge.execute_js_from_thread.connect(self._execute_script_in_main_thread)
+
+        if self._fullscreen_support:
+            self.bridge.fullscreen_changed.connect(self._default_on_fullscreen_change)
 
         self._resize_throttle_timer = QTimer(self)
         self._resize_throttle_timer.setSingleShot(True)
@@ -291,6 +304,7 @@ class QtWebView2Widget(QWidget):
             return
 
         # CoreWebView2 is now ready and can be configured
+        core_webview = self._webview.CoreWebView2
         settings = self._webview.CoreWebView2.Settings
         settings.IsScriptEnabled = True
         settings.IsWebMessageEnabled = True
@@ -305,6 +319,14 @@ class QtWebView2Widget(QWidget):
 
         if self._handle_new_window:
             self._webview.CoreWebView2.NewWindowRequested += self._on_new_window_request
+
+        core_webview.ContainsFullScreenElementChanged += self._on_contains_fullscreen_element_changed
+
+        if self._init_settings_hook:
+            try:
+                self._init_settings_hook(core_webview)
+            except Exception as e:
+                logger.error(f"Error in init_settings_hook: {repr(e)}", exc_info=True)
 
         self.is_ready = True
         self._webview_hwnd = self._webview.Handle.ToInt32()
@@ -340,6 +362,10 @@ class QtWebView2Widget(QWidget):
             getattr(self, method_name)(*args, **kwargs)
         self._pending_calls.clear()
 
+    def _on_contains_fullscreen_element_changed(self, sender, args):
+        is_full = sender.ContainsFullScreenElement
+        self.bridge.fullscreen_changed.emit(is_full)
+
     def _on_web_resource_requested(self, sender, args):
         try:
             deferral = args.GetDeferral()
@@ -357,6 +383,21 @@ class QtWebView2Widget(QWidget):
         except Exception as e:
             logger.error(f"Error in WSGI worker thread: {e}", exc_info=True)
             self._wsgi_response_ready.emit(args, deferral, "500 Internal Server Error", [], None)
+
+    @Slot(bool)
+    def _default_on_fullscreen_change(self, is_fullscreen: bool):
+        window = self.window()
+        if not window:
+            return
+
+        if is_fullscreen:
+            self._saved_window_state = window.windowState()
+            window.showFullScreen()
+        else:
+            if self._saved_window_state is not None:
+                window.setWindowState(self._saved_window_state)
+            else:
+                window.showNormal()
 
     @Slot(object, object, str, list, object)
     def _finalize_wsgi_response(self, args, deferral, status, headers, iterator):
