@@ -302,6 +302,6 @@ if __name__ == "__main__":
 
 ## 许可证
 
-版权所有 (c) 2025 Xiaosu。
+版权所有 (c) 2025-2026 Xiaosu。
 
 根据 [Mozilla Public License Version 2.0](https://github.com/xiaosuyyds/QtWebView2/blob/master/LICENSE) 的条款分发。

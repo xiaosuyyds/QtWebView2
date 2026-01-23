@@ -296,6 +296,6 @@ if __name__ == "__main__":
 
 ## License
 
-Copyright (c) 2025 Xiaosu.
+Copyright (c) 2025-2026 Xiaosu.
 
 Distributed under the terms of the [Mozilla Public License Version 2.0](https://github.com/xiaosuyyds/QtWebView2/blob/master/LICENSE).
