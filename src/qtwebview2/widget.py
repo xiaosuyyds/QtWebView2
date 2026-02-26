@@ -1,9 +1,11 @@
 # This Source Code Form is subject to the terms of the Mozilla Public
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
+from __future__ import annotations
 
 import json
 import os
+import threading
 import typing
 import uuid
 import webbrowser
@@ -18,42 +20,7 @@ from qtpy.QtWidgets import QWidget
 
 from .logger import logger
 from . import exceptions
-from .utils import get_absolute_path
-
-try:
-    import clr
-
-    clr.AddReference('System')
-    clr.AddReference('System.IO')
-    clr.AddReference('System.Drawing')
-    from System import Uri
-    from System.Drawing import Color as DotNetColor, ColorTranslator
-    from System.IO import Path as DotNetPath
-
-    # Add .NET library references required by WebView2
-    clr.AddReference(get_absolute_path('lib/Microsoft.Web.WebView2.WinForms'))
-    clr.AddReference(get_absolute_path('lib/Microsoft.Web.WebView2.Core'))
-    from Microsoft.Web.WebView2.Core import CoreWebView2InitializationCompletedEventArgs, \
-        CoreWebView2WebMessageReceivedEventArgs, CoreWebView2WebResourceContext
-    from Microsoft.Web.WebView2.WinForms import WebView2, CoreWebView2CreationProperties
-
-except Exception as e:
-    # Log detailed information for developers
-    logger.critical("Critical Error: Failed to initialize .NET environment for WebView2.", exc_info=True)
-
-    user_msg = (
-        "Failed to initialize core component WebView2.\n\n"
-        "This is likely because your system is missing the 'WebView2 Evergreen Runtime'."
-    )
-
-    # Raise an exception
-    raise exceptions.WebView2RuntimeExceptionNotFound(
-        message=f"Failed to initialize .NET environment. Original error: {repr(e)}",
-        user_message=user_msg,
-        download_url="https://go.microsoft.com/fwlink/p/?LinkId=2124703"
-    ) from e
-
-from .wsgi_server import WebView2WSGIServer, PythonGeneratorStream, extract_request_data
+from . import _dotnet_bridge as dotnet
 
 
 class QtWebView2ApiBridge(QObject):
@@ -107,6 +74,7 @@ class QtWebView2Widget(QWidget):
     """
 
     _wsgi_response_ready = Signal(object, object, str, list, object)
+    _init_webview2_signal = Signal()
 
     def __init__(
             self,
@@ -135,8 +103,8 @@ class QtWebView2Widget(QWidget):
         :param debug: Whether to enable debug mode. Disabling it will turn off hotkeys and dev tools. If disabled, it's
           recommended to also disable context_menus.
         :param context_menus: Whether to enable the right-click context menu
-        :param transparent: Whether to use transparent mode (this has a bug when switching pages; remember to set th
-          e body's background color style to transparent for it to work)
+        :param transparent: Whether to use transparent mode (this has a bug when switching pages; remember to set the
+          body's background color style to transparent for it to work)
         :param background_color: Background color, conflicts with transparent
         :param handle_new_window: Whether to handle new windows. If enabled, the target URL will be opened in the user's
           default browser
@@ -164,6 +132,12 @@ class QtWebView2Widget(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
         self.setAttribute(Qt.WidgetAttribute.WA_DontCreateNativeAncestors)
 
+        self._init_webview2_signal.connect(self._init_webview)
+
+        self._lazyload = lazyload
+        if self._lazyload and not dotnet.dotnet_load_flag:
+            threading.Thread(target=dotnet.load_dotnet_env, daemon=True).start()
+
         # --- Configuration Properties ---
         self.url = url
         if isinstance(js_apis, dict) or js_apis is None:
@@ -175,7 +149,7 @@ class QtWebView2Widget(QWidget):
 
         self.wsgi_app = wsgi_app
         self.wsgi_host_name = wsgi_host_name or "qtwebview2.local"
-        self._wsgi_server: Optional[WebView2WSGIServer] = None
+        self._wsgi_server = None
         if isinstance(wsgi_executor, int):
             self._wsgi_executor = concurrent.futures.ThreadPoolExecutor(max_workers=wsgi_executor)
         elif isinstance(wsgi_executor, concurrent.futures.Executor):
@@ -201,7 +175,10 @@ class QtWebView2Widget(QWidget):
         self._fullscreen_support = fullscreen_support
 
         # --- Internal State ---
-        self._webview: Optional[WebView2] = None
+        if typing.TYPE_CHECKING:
+            self._webview: Optional[dotnet.Microsoft.Web.WebView2.WinForms.WebView2] = None
+        else:
+            self._webview = None
         self._webview_hwnd: Optional[int] = None
         self._js_callbacks: dict[str, Callable[..., Any]] = {}
         self._saved_window_state = None
@@ -222,18 +199,23 @@ class QtWebView2Widget(QWidget):
         self._resize_throttle_timer.setInterval(int(1000 / 60))
         self._resize_throttle_timer.timeout.connect(self._resize_webview)
 
-        self._lazyload = lazyload
+        if not self._lazyload:
+            if not dotnet.dotnet_load_flag:
+                threading.Thread(
+                    target=lambda: dotnet.load_dotnet_env(self._init_webview2_signal.emit),
+                    daemon=True
+                ).start()
+            else:
+                QTimer.singleShot(0, self._init_webview)
 
         self._pending_calls = []  # Store calls made before initialization
         self._has_shown = False
-        if not self._lazyload:
-            self._init_webview()
 
     def showEvent(self, event):
         super().showEvent(event)
         if self._lazyload and not self._has_shown:
             self._has_shown = True
-            self._init_webview()
+            QTimer.singleShot(0, self._init_webview)
 
         if self.is_ready:
             self._webview.Visible = True
@@ -247,10 +229,16 @@ class QtWebView2Widget(QWidget):
         """
         Asynchronously initializes the WebView2 control.
         """
-        try:
-            self._webview = WebView2()
 
-            props = CoreWebView2CreationProperties()
+        if self._webview:
+            logger.warning("WebView2 already initialized", stack_info=True)
+            return
+
+        dotnet.load_dotnet_env()
+        try:
+            self._webview = dotnet.Microsoft.Web.WebView2.WinForms.WebView2()
+
+            props = dotnet.Microsoft.Web.WebView2.WinForms.CoreWebView2CreationProperties()
 
             if not self._no_local_storage:
                 user_data_folder = self._user_data_folder
@@ -258,7 +246,7 @@ class QtWebView2Widget(QWidget):
                     app_name = QCoreApplication.applicationName() or "DefaultQtApp"
                     data_path = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppLocalDataLocation)
                     if not data_path:
-                        data_path = os.path.join(DotNetPath.GetTempPath(), app_name)
+                        data_path = os.path.join(dotnet.System.IO.Path.GetTempPath(), app_name)
                     user_data_folder = os.path.join(data_path, "WebView2_UserData")
 
                 logger.debug(f"WebView2 UserDataFolder: {user_data_folder}")
@@ -273,9 +261,10 @@ class QtWebView2Widget(QWidget):
             self._webview.WebMessageReceived += self._on_script_notify
 
             if self._is_transparent:
-                self._webview.DefaultBackgroundColor = DotNetColor.Transparent
+                self._webview.DefaultBackgroundColor = dotnet.System.Drawing.Color.Transparent
             elif self.background_color:
-                self._webview.DefaultBackgroundColor = ColorTranslator.FromHtml(self.background_color)
+                self._webview.DefaultBackgroundColor = dotnet.System.Drawing.ColorTranslator.FromHtml(
+                    self.background_color)
 
             self._webview.EnsureCoreWebView2Async(None)
 
@@ -284,7 +273,8 @@ class QtWebView2Widget(QWidget):
             self.bridge.initialization_done.emit(False, str(e))
             raise exceptions.WebviewInitException(e)
 
-    def _on_webview_ready(self, sender: WebView2, args: CoreWebView2InitializationCompletedEventArgs):
+    def _on_webview_ready(self, sender: dotnet.Microsoft.Web.WebView2.WinForms.WebView2,
+                          args: dotnet.Microsoft.Web.WebView2.Core.CoreWebView2InitializationCompletedEventArgs):
         """ .NET event handler, executed on a non-Qt thread. Emits a signal to return control to the Qt main thread. """
         if not args.IsSuccess:
             error_msg = str(args.InitializationException)
@@ -342,12 +332,17 @@ class QtWebView2Widget(QWidget):
 
         if self.wsgi_app:
             logger.info(f"WSGI application detected. Intercepting requests for host: {self.wsgi_host_name}")
+            from .wsgi_server import WebView2WSGIServer
             self._wsgi_server = WebView2WSGIServer(self.wsgi_app)
 
-            self._webview.CoreWebView2.AddWebResourceRequestedFilter(f"http://{self.wsgi_host_name}/*",
-                                                                     CoreWebView2WebResourceContext.All)
-            self._webview.CoreWebView2.AddWebResourceRequestedFilter(f"https://{self.wsgi_host_name}/*",
-                                                                     CoreWebView2WebResourceContext.All)
+            self._webview.CoreWebView2.AddWebResourceRequestedFilter(
+                f"http://{self.wsgi_host_name}/*",
+                dotnet.Microsoft.Web.WebView2.Core.CoreWebView2WebResourceContext.All
+            )
+            self._webview.CoreWebView2.AddWebResourceRequestedFilter(
+                f"https://{self.wsgi_host_name}/*",
+                dotnet.Microsoft.Web.WebView2.Core.CoreWebView2WebResourceContext.All
+            )
 
             self._webview.CoreWebView2.WebResourceRequested += self._on_web_resource_requested
 
@@ -367,6 +362,7 @@ class QtWebView2Widget(QWidget):
         self.bridge.fullscreen_changed.emit(is_full)
 
     def _on_web_resource_requested(self, sender, args):
+        from .wsgi_server import extract_request_data
         try:
             deferral = args.GetDeferral()
             req_data = extract_request_data(args)
@@ -401,6 +397,7 @@ class QtWebView2Widget(QWidget):
 
     @Slot(object, object, str, list, object)
     def _finalize_wsgi_response(self, args, deferral, status, headers, iterator):
+        from .wsgi_server import PythonGeneratorStream
         try:
             if not status or status.startswith('500') or iterator is None:
                 reason_phrase = "Internal Server Error"
@@ -448,7 +445,8 @@ class QtWebView2Widget(QWidget):
         webbrowser.open(uri_string)
         args.Handled = True
 
-    def _on_script_notify(self, sender, args: CoreWebView2WebMessageReceivedEventArgs):
+    def _on_script_notify(self, sender,
+                          args: dotnet.Microsoft.Web.WebView2.Core.CoreWebView2WebMessageReceivedEventArgs):
         try:
             self.bridge.web_message_received.emit(args.WebMessageAsJson)
         except Exception as e:
@@ -573,7 +571,7 @@ class QtWebView2Widget(QWidget):
     def load_url(self, url: str):
         """Loads a URL."""
         if self.is_ready:
-            self._webview.Source = Uri(url)
+            self._webview.Source = dotnet.System.Uri(url)
         else:
             self._pending_calls.append(('load_url', (url,), {}))
 

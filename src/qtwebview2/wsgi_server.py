@@ -1,7 +1,7 @@
 # This Source Code Form is subject to the terms of the Mozilla Public
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
-
+import ctypes
 import itertools
 import sys
 import io
@@ -9,19 +9,19 @@ import threading
 from typing import Callable
 from urllib.parse import urlparse
 
-from System.IO import Stream, MemoryStream
-from System import Array, Byte
-from Microsoft.Web.WebView2.Core import CoreWebView2WebResourceRequestedEventArgs
-
 from .logger import logger
+from . import _dotnet_bridge as dotnet
 
 
-class PythonGeneratorStream(Stream):
+dotnet.load_dotnet_env()
+
+
+class PythonGeneratorStream(dotnet.System.IO.Stream):
     __namespace__ = "qtwebview2.wsgi_server.PythonGeneratorStream"
 
     def __init__(self, generator):
         self._generator = generator
-        self._buffer = b''
+        self._buffer = bytearray()
         self._finished = False
         self._lock = threading.Lock()
 
@@ -37,7 +37,7 @@ class PythonGeneratorStream(Stream):
                         if isinstance(chunk, str):
                             chunk = chunk.encode('utf-8')
                         if chunk:
-                            self._buffer += chunk
+                            self._buffer.extend(chunk)
                     except StopIteration:
                         self._finished = True
                         break
@@ -45,11 +45,12 @@ class PythonGeneratorStream(Stream):
                 bytes_to_read = min(count, len(self._buffer))
 
                 if bytes_to_read > 0:
-                    data_chunk = self._buffer[:bytes_to_read]
-                    # Create .NET array from python bytes
-                    net_source_array = Array[Byte](data_chunk)
-                    Array.Copy(net_source_array, 0, buffer, offset, bytes_to_read)
-                    self._buffer = self._buffer[bytes_to_read:]
+                    addr_obj = (ctypes.c_char * len(self._buffer)).from_buffer(self._buffer)
+                    source_ptr = dotnet.System.IntPtr(ctypes.addressof(addr_obj))
+                    dotnet.System.Runtime.InteropServices.Marshal.Copy(source_ptr, buffer, offset, bytes_to_read)
+
+                    del addr_obj
+                    del self._buffer[:bytes_to_read]
 
                 return bytes_to_read
         except Exception as e:
@@ -95,7 +96,7 @@ class PythonGeneratorStream(Stream):
         super().Close()
 
 
-def extract_request_data(args: CoreWebView2WebResourceRequestedEventArgs) -> dict:
+def extract_request_data(args: dotnet.Microsoft.Web.WebView2.Core.CoreWebView2WebResourceRequestedEventArgs) -> dict:
     """
     [主线程运行] 从 WebView2 的 args 中提取所有必要信息转换为纯 Python 对象。
     """
@@ -109,18 +110,18 @@ def extract_request_data(args: CoreWebView2WebResourceRequestedEventArgs) -> dic
         headers_dict[header.Key] = header.Value
 
     # 提取 Body
-    request_body = b''
+    request_body = bytearray()
     if request.Content is not None:
         source_stream = request.Content
-        buffer = Array[Byte](4096)
+        buffer = dotnet.System.Array[dotnet.System.Byte](4096)
 
-        with MemoryStream() as ms:
-            while True:
-                bytes_read = source_stream.Read(buffer, 0, buffer.Length)
-                if bytes_read == 0:
-                    break
-                ms.Write(buffer, 0, bytes_read)
-            request_body = ms.ToArray().tobytes()
+        while True:
+            bytes_read = source_stream.Read(buffer, 0, 4096)
+            if bytes_read == 0:
+                break
+            request_body.extend(buffer[:bytes_read])
+
+    request_body = bytes(request_body)
 
     return {
         'uri': uri_str,
@@ -205,11 +206,8 @@ class WebView2WSGIServer:
         def start_response(s, h, exc_info=None):
             nonlocal status, headers, headers_sent
             if exc_info:
-                try:
-                    if headers_sent:
-                        raise exc_info[1].with_traceback(exc_info[2])
-                finally:
-                    exc_info = None
+                if headers_sent:
+                    raise exc_info[1].with_traceback(exc_info[2])
             elif headers is not None:
                 raise AssertionError("Headers already set!")
 
