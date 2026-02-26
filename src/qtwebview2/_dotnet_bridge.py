@@ -15,16 +15,21 @@ if typing.TYPE_CHECKING:
 
     import Microsoft.Web.WebView2.Core
     import Microsoft.Web.WebView2.WinForms
+
+    System_ = System
+    Core = Microsoft.Web.WebView2.Core
+    WinForms = Microsoft.Web.WebView2.WinForms
+
 else:
-    System = None
-    Microsoft = None
+    System_ = None
+    Core = None
+    WinForms = None
 
 
 def load_dotnet_env(callback=None):
     global dotnet_load_flag
 
-    if not typing.TYPE_CHECKING:
-        global System, Microsoft
+    global System_, Core, WinForms
 
     try:
         with dotnet_load_lock:
@@ -49,6 +54,10 @@ def load_dotnet_env(callback=None):
             clr.AddReference(get_absolute_path('lib/Microsoft.Web.WebView2.Core'))
             import Microsoft.Web.WebView2.Core
             import Microsoft.Web.WebView2.WinForms
+
+            System_ = System
+            Core = Microsoft.Web.WebView2.Core
+            WinForms = Microsoft.Web.WebView2.WinForms
 
             dotnet_load_flag = True
 

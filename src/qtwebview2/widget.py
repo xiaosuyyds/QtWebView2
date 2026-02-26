@@ -176,7 +176,7 @@ class QtWebView2Widget(QWidget):
 
         # --- Internal State ---
         if typing.TYPE_CHECKING:
-            self._webview: Optional[dotnet.Microsoft.Web.WebView2.WinForms.WebView2] = None
+            self._webview: Optional[dotnet.WinForms.WebView2] = None
         else:
             self._webview = None
         self._webview_hwnd: Optional[int] = None
@@ -236,9 +236,9 @@ class QtWebView2Widget(QWidget):
 
         dotnet.load_dotnet_env()
         try:
-            self._webview = dotnet.Microsoft.Web.WebView2.WinForms.WebView2()
+            self._webview = dotnet.WinForms.WebView2()
 
-            props = dotnet.Microsoft.Web.WebView2.WinForms.CoreWebView2CreationProperties()
+            props = dotnet.WinForms.CoreWebView2CreationProperties()
 
             if not self._no_local_storage:
                 user_data_folder = self._user_data_folder
@@ -246,7 +246,7 @@ class QtWebView2Widget(QWidget):
                     app_name = QCoreApplication.applicationName() or "DefaultQtApp"
                     data_path = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppLocalDataLocation)
                     if not data_path:
-                        data_path = os.path.join(dotnet.System.IO.Path.GetTempPath(), app_name)
+                        data_path = os.path.join(dotnet.System_.IO.Path.GetTempPath(), app_name)
                     user_data_folder = os.path.join(data_path, "WebView2_UserData")
 
                 logger.debug(f"WebView2 UserDataFolder: {user_data_folder}")
@@ -261,9 +261,9 @@ class QtWebView2Widget(QWidget):
             self._webview.WebMessageReceived += self._on_script_notify
 
             if self._is_transparent:
-                self._webview.DefaultBackgroundColor = dotnet.System.Drawing.Color.Transparent
+                self._webview.DefaultBackgroundColor = dotnet.System_.Drawing.Color.Transparent
             elif self.background_color:
-                self._webview.DefaultBackgroundColor = dotnet.System.Drawing.ColorTranslator.FromHtml(
+                self._webview.DefaultBackgroundColor = dotnet.System_.Drawing.ColorTranslator.FromHtml(
                     self.background_color)
 
             self._webview.EnsureCoreWebView2Async(None)
@@ -273,8 +273,8 @@ class QtWebView2Widget(QWidget):
             self.bridge.initialization_done.emit(False, str(e))
             raise exceptions.WebviewInitException(e)
 
-    def _on_webview_ready(self, sender: dotnet.Microsoft.Web.WebView2.WinForms.WebView2,
-                          args: dotnet.Microsoft.Web.WebView2.Core.CoreWebView2InitializationCompletedEventArgs):
+    def _on_webview_ready(self, sender: dotnet.WinForms.WebView2,
+                          args: dotnet.Core.CoreWebView2InitializationCompletedEventArgs):
         """ .NET event handler, executed on a non-Qt thread. Emits a signal to return control to the Qt main thread. """
         if not args.IsSuccess:
             error_msg = str(args.InitializationException)
@@ -337,11 +337,11 @@ class QtWebView2Widget(QWidget):
 
             self._webview.CoreWebView2.AddWebResourceRequestedFilter(
                 f"http://{self.wsgi_host_name}/*",
-                dotnet.Microsoft.Web.WebView2.Core.CoreWebView2WebResourceContext.All
+                dotnet.Core.CoreWebView2WebResourceContext.All
             )
             self._webview.CoreWebView2.AddWebResourceRequestedFilter(
                 f"https://{self.wsgi_host_name}/*",
-                dotnet.Microsoft.Web.WebView2.Core.CoreWebView2WebResourceContext.All
+                dotnet.Core.CoreWebView2WebResourceContext.All
             )
 
             self._webview.CoreWebView2.WebResourceRequested += self._on_web_resource_requested
@@ -446,7 +446,7 @@ class QtWebView2Widget(QWidget):
         args.Handled = True
 
     def _on_script_notify(self, sender,
-                          args: dotnet.Microsoft.Web.WebView2.Core.CoreWebView2WebMessageReceivedEventArgs):
+                          args: dotnet.Core.CoreWebView2WebMessageReceivedEventArgs):
         try:
             self.bridge.web_message_received.emit(args.WebMessageAsJson)
         except Exception as e:
@@ -571,7 +571,7 @@ class QtWebView2Widget(QWidget):
     def load_url(self, url: str):
         """Loads a URL."""
         if self.is_ready:
-            self._webview.Source = dotnet.System.Uri(url)
+            self._webview.Source = dotnet.System_.Uri(url)
         else:
             self._pending_calls.append(('load_url', (url,), {}))
 

@@ -16,7 +16,7 @@ from . import _dotnet_bridge as dotnet
 dotnet.load_dotnet_env()
 
 
-class PythonGeneratorStream(dotnet.System.IO.Stream):
+class PythonGeneratorStream(dotnet.System_.IO.Stream):
     __namespace__ = "qtwebview2.wsgi_server.PythonGeneratorStream"
 
     def __init__(self, generator):
@@ -46,8 +46,8 @@ class PythonGeneratorStream(dotnet.System.IO.Stream):
 
                 if bytes_to_read > 0:
                     addr_obj = (ctypes.c_char * len(self._buffer)).from_buffer(self._buffer)
-                    source_ptr = dotnet.System.IntPtr(ctypes.addressof(addr_obj))
-                    dotnet.System.Runtime.InteropServices.Marshal.Copy(source_ptr, buffer, offset, bytes_to_read)
+                    source_ptr = dotnet.System_.IntPtr(ctypes.addressof(addr_obj))
+                    dotnet.System_.Runtime.InteropServices.Marshal.Copy(source_ptr, buffer, offset, bytes_to_read)
 
                     del addr_obj
                     del self._buffer[:bytes_to_read]
@@ -96,7 +96,7 @@ class PythonGeneratorStream(dotnet.System.IO.Stream):
         super().Close()
 
 
-def extract_request_data(args: dotnet.Microsoft.Web.WebView2.Core.CoreWebView2WebResourceRequestedEventArgs) -> dict:
+def extract_request_data(args: dotnet.Core.CoreWebView2WebResourceRequestedEventArgs) -> dict:
     """
     [主线程运行] 从 WebView2 的 args 中提取所有必要信息转换为纯 Python 对象。
     """
@@ -113,7 +113,7 @@ def extract_request_data(args: dotnet.Microsoft.Web.WebView2.Core.CoreWebView2We
     request_body = bytearray()
     if request.Content is not None:
         source_stream = request.Content
-        buffer = dotnet.System.Array[dotnet.System.Byte](4096)
+        buffer = dotnet.System_.Array[dotnet.System_.Byte](4096)
 
         while True:
             bytes_read = source_stream.Read(buffer, 0, 4096)
