@@ -30,7 +30,7 @@ from io import BytesIO
 from typing import Callable, Any, Optional, Union
 from typing_extensions import deprecated
 from qtpy.QtCore import Qt, QTimer, QStandardPaths
-from qtpy.QtWidgets import QWidget
+from qtpy.QtWidgets import QWidget, QApplication
 from qtpy.QtGui import QWindow
 from qtpy.QtWidgets import QVBoxLayout
 from wryview import WebView, NewWindowResponse, DragDropEvent
@@ -251,6 +251,11 @@ class QtWebViewWidget(QWidget):
 
         if not self._lazyload:
             self._start_webview()
+
+        # Ensure webview is dropped cleanly on any exit path
+        # (closeEvent is only called when the window manager closes the widget;
+        # QApplication.quit() / process exit may skip it, losing localStorage).
+        QApplication.instance().aboutToQuit.connect(self._teardown_webview)
 
     # ── WebView creation ────────────────────────────────────────────────────
 
@@ -672,6 +677,15 @@ class QtWebViewWidget(QWidget):
             self._fs_window.raise_()
             self._fs_window.activateWindow()
 
+    def _teardown_webview(self):
+        """Drop the webview cleanly"""
+        if self._webview is not None:
+            logger.debug("[%s] teardown via aboutToQuit", self)
+            self._webview = None
+        if self._anchor:
+            self._anchor.deleteLater()
+            self._anchor = None
+
     def hideEvent(self, event):
         super().hideEvent(event)
         if self._fs_window:
@@ -686,13 +700,7 @@ class QtWebViewWidget(QWidget):
         self._resize_webview()
 
     def closeEvent(self, event):
-        logger.debug("[%s] closing", self)
-        # Drop webview first (child HWND must outlive parent),
-        # then tear down the anchor window that hosted it.
-        self._webview = None
-        if self._anchor:
-            self._anchor.deleteLater()
-            self._anchor = None
+        self._teardown_webview()
         super().closeEvent(event)
 
     # ── Cookie ────────────────────────────────────────────────────────
