@@ -91,26 +91,25 @@ BRIDGE_SCRIPT = """
         });
     }
 
-    window.qtwebview = window.qtwebview2 = {
-        api: new Proxy({}, {
-            get: function(target, prop) {
-                return function() {
-                    var args = Array.prototype.slice.call(arguments);
-                    // meta-call: api.call("funcName", ...args) → api["funcName"](...args)
-                    if (prop === 'call') {
-                        return target.api[args[0]].apply(null, args.slice(1));
-                    }
-                    var callId = genId();
-                    return new Promise(function(resolve, reject) {
-                        pending[callId] = {resolve: resolve, reject: reject};
-                        window.ipc.postMessage(JSON.stringify({
-                            type: "qtwebview", name: prop, params: args, id: callId
-                        }));
-                    });
-                };
-            }
-        })
-    };
+    var apiProxy = new Proxy({}, {
+        get: function(target, prop) {
+            return function() {
+                var args = Array.prototype.slice.call(arguments);
+                // meta-call: api.call("funcName", ...args) → api["funcName"](...args)
+                if (prop === 'call') {
+                    return apiProxy[args[0]].apply(null, args.slice(1));
+                }
+                var callId = genId();
+                return new Promise(function(resolve, reject) {
+                    pending[callId] = {resolve: resolve, reject: reject};
+                    window.ipc.postMessage(JSON.stringify({
+                        type: "qtwebview", name: prop, params: args, id: callId
+                    }));
+                });
+            };
+        }
+    });
+    window.qtwebview = window.qtwebview2 = { api: apiProxy };
 
     // Listen for Python responses via CustomEvent
     window.addEventListener('qtwebview-response', function(e) {
