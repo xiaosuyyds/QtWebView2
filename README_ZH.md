@@ -73,7 +73,7 @@ sys.exit(app.exec())
 import sys
 from qtpy.QtWidgets import QApplication, QVBoxLayout, QWidget
 from qtpy.QtCore import Slot, QCoreApplication
-from qtwebview2 import QtWebViewWidget, DictJsBridge
+from qtwebview2 import QtWebViewWidget, DictJsBridge, PageLoadEvent
 
 # 设置一个应用名称，以便用户数据文件夹路径保持稳定
 QCoreApplication.setApplicationName("QtWebView-Demo")
@@ -129,9 +129,9 @@ webview.load_html(html_content)
 
 
 # 6. Python → JS: 页面加载完成后执行 JavaScript
-@Slot(str, str)
+@Slot(PageLoadEvent, str)
 def on_page_loaded(evt, url):
-    if evt == "Finished":
+    if evt == PageLoadEvent.Finished:
         webview.evaluate_js("""(function() {
             const new_element = document.createElement('h2');
             new_element.textContent = '来自Python的问候！';
@@ -337,49 +337,63 @@ def closeEvent(self, event):
 from qtwebview2 import QtWebView2Widget    from qtwebview2 import QtWebViewWidget
 webview = QtWebView2Widget(url=...)        webview = QtWebViewWidget(url=...)
 
-# 参数名称变更：
-# handle_new_window=True/False   → new_window_handler=lambda url: "allow"|"deny"
+# 参数名称/行为变更：
+# handle_new_window=True/False   → new_window_handler=lambda url: NewWindowResponse.Deny
 # wsgi_host_name="myapp.local"   → wsgi_scheme="qtwebview"
 # browser_executable_folder=...  → (wry 不支持)
 # fullscreen_support=True        → fullscreen_handler=自定义处理函数
-# no_local_storage=True          → (已移除，使用 incognito=True)
-
-# 已移除的参数（无对等项）：
-# context_menus, init_settings_hook
+# no_local_storage=True          → user_data_folder=None（跳过数据目录）
+# init_settings_hook             → (已移除，无对等项)
 
 # v0.6.0 新增参数：
 # html, headers, navigation_handler, incognito, autoplay,
 # javascript_enabled, hotkeys_zoom, drag_drop_handler,
-# js_apis, wsgi_executor, fullscreen_handler, parent, native_child
+# js_apis, wsgi_executor, fullscreen_handler, parent, native_child,
+# proxy, clipboard, https_scheme, download_started_handler,
+# download_completed_handler, wsgi_port
 ```
 
 ## 📦 API 概览
 
 ```python
+from qtwebview2 import NewWindowResponse, DragDropEvent, PageLoadEvent
+
 webview = QtWebViewWidget(
-    url="https://example.com",           # 初始 URL
-    html="<h1>Hello</h1>",               # 或初始 HTML
-    headers={"Authorization": "Bearer"},  # 自定义 HTTP 头
+    url="https://example.com",              # 初始 URL
+    html="<h1>Hello</h1>",                  # 或初始 HTML
+    headers={"Authorization": "Bearer"},     # 自定义 HTTP 头
     user_agent="CustomAgent/1.0",
-    debug=True,                            # DevTools 开启
+    debug=True,                              # DevTools 开启
     transparent=False,
     background_color="#1e1e1e",
-    navigation_handler=lambda url: True,   # 返回 False 阻止导航
-    new_window_handler=lambda url: "allow",
-    lazyload=True,                         # 延迟到 showEvent 加载
-    js_apis=DictJsBridge(),               # JS API 桥接
+    navigation_handler=lambda url: True,     # 返回 False 阻止导航
+    new_window_handler=lambda url: NewWindowResponse.Deny,
+    lazyload=True,                           # 延迟到 showEvent 加载
+    js_apis=DictJsBridge(),                 # JS API 桥接
+    user_data_folder="/path/to/cache",      # 不传则自动生成，
+                                            # 传 None 则跳过
     incognito=False,
-    user_data_folder="/path/to/cache",
     wsgi_app=flask_app,
     wsgi_scheme="qtwebview",
-    wsgi_executor=8,                       # WSGI 线程池大小
+    wsgi_executor=8,                         # WSGI 线程池大小
+    wsgi_port=None,                          # localhost TCP 端口（自动）
+    proxy={"type": "http", "host": "127.0.0.1", "port": "8080"},
+    back_forward_gestures=False,
+    clipboard=True,                          # 仅 Windows/Linux
+    https_scheme=True,                       # 自定义协议安全上下文
+    context_menus=True,                      # 原生右键菜单
+    download_started_handler=lambda url, path: True,
+    download_completed_handler=lambda url, path, ok: None,
     autoplay=False,
     javascript_enabled=True,
-    hotkeys_zoom=True,
-    drag_drop_handler=lambda evt, paths, pos: True,
-    fullscreen_handler=lambda enter: ...,  # 自定义全屏行为
-    native_child=False,                    # 锚点窗口模式
-    parent=self,                           # 父级 QWidget
+    hotkeys_zoom=True,                       # 仅 Windows
+    initialization_script=None,              # None = 不注入脚本，
+                                            # 不传 = 默认注入桥接+全屏，
+                                            # 字符串 = 自定义脚本
+    drag_drop_handler=lambda evt: DragDropEvent,
+    fullscreen_handler=lambda enter: ...,    # 自定义全屏行为
+    native_child=False,                      # 锚点窗口模式
+    parent=self,                             # 父级 QWidget
 )
 
 webview.load_url(url)                     # 导航
@@ -395,6 +409,7 @@ webview.set_cookie(name, value)           # 设置 cookie
 webview.delete_cookie(name, url)          # 删除 cookie
 webview.open_devtools()                   # 打开 DevTools
 webview.close_devtools()                  # 关闭 DevTools
+webview.is_devtools_open()                # 检查 DevTools 状态
 webview.zoom(1.5)                         # 缩放 150%
 webview.print()                           # 打印页面
 webview.focus()                           # 聚焦 webview
@@ -402,7 +417,7 @@ webview.set_background_color(r, g, b, a)  # 设置背景颜色
 webview.clear_all_browsing_data()         # 清除缓存
 
 # 信号
-webview.signals.page_loaded.connect(lambda evt, url: ...)
+webview.signals.page_loaded.connect(lambda evt, url: ...)        # evt 为 PageLoadEvent
 webview.signals.title_changed.connect(lambda title: ...)
 webview.signals.navigation_requested.connect(lambda url: ...)
 webview.signals.new_window_requested.connect(lambda url: ...)

@@ -24,6 +24,7 @@ import functools
 import json
 import logging
 import sys
+import time
 import webbrowser
 from io import BytesIO
 from typing import Callable, Any, Optional, Union
@@ -32,11 +33,11 @@ from qtpy.QtCore import Qt, QTimer, QStandardPaths
 from qtpy.QtWidgets import QWidget
 from qtpy.QtGui import QWindow
 from qtpy.QtWidgets import QVBoxLayout
-from wryview import WebView
+from wryview import WebView, NewWindowResponse, DragDropEvent
 
 from ._bridge import (
     QtWebViewSignals, QtWebViewJsBridge, DictJsBridge,
-    _JS_BRIDGE, _FULLSCREEN_JS,
+    BRIDGE_SCRIPT, FULLSCREEN_SCRIPT,
 )
 from ._anchor import _AnchorWindow
 
@@ -69,7 +70,7 @@ def _require_webview(error_if_not_ready: bool = False):
 def default_new_window_handler(url: str):
     # Open in the default browser
     webbrowser.open(url)
-    return 'deny'
+    return NewWindowResponse.Deny
 
 
 _NOT_GIVEN: Any = object()
@@ -90,18 +91,27 @@ class QtWebViewWidget(QWidget):
             transparent: bool = False,
             background_color: Optional[str] = None,
             navigation_handler: Optional[Callable[[str], bool]] = None,
-            new_window_handler: Optional[Callable[[str], str]] = default_new_window_handler,
+            new_window_handler: Optional[Callable[[str], NewWindowResponse]] = default_new_window_handler,
             lazyload: bool = True,
             js_apis: Union[dict[str, Callable[..., Any]], QtWebViewJsBridge, None] = None,
-            user_data_folder: Optional[str] = None,
+            user_data_folder: Union[str, None] = _NOT_GIVEN,
             incognito: bool = False,
             wsgi_app: Optional[Callable[..., Any]] = None,
             wsgi_scheme: Optional[str] = None,
             wsgi_executor: Union[concurrent.futures.Executor, int] = 8,
+            wsgi_port: Optional[int] = None,
+            proxy: Optional[dict[str, str]] = None,
+            back_forward_gestures: bool = False,
+            clipboard: bool = True,
+            https_scheme: bool = True,
+            context_menus: bool = True,
+            download_started_handler: Optional[Callable[[str, str], Union[bool, str]]] = None,
+            download_completed_handler: Optional[Callable[[str, Optional[str], bool], None]] = None,
             autoplay: bool = False,
             javascript_enabled: bool = True,
             hotkeys_zoom: bool = True,
-            drag_drop_handler: Optional[Callable[[str, list, tuple], bool]] = None,
+            initialization_script: Union[str, None] = _NOT_GIVEN,
+            drag_drop_handler: Optional[Callable[[DragDropEvent, list, tuple], bool]] = None,
             fullscreen_handler: Optional[Callable[[bool], None]] = _NOT_GIVEN,
             native_child: bool = False,
             parent: Optional[QWidget] = None,
@@ -111,32 +121,61 @@ class QtWebViewWidget(QWidget):
 
         :param url: The initial URL to load.
         :param user_agent: Custom User-Agent string.
-        :param debug: Enable DevTools and browser accelerator keys.
+        :param debug: Enable DevTools (right-click → Inspect, F12).
         :param transparent: Enable transparent background mode.
         :param background_color: Background color as hex string (e.g. "#1e1e1e").
         :param navigation_handler: Callable(url) → bool. Return False to block navigation.
-        :param new_window_handler: Callable(url) → "allow" | "deny".
+        :param new_window_handler: Callable(url) → :class:`NewWindowResponse`.
         :param lazyload: Defer WebView creation to showEvent. Window appears instantly,
             WebView loads after. Enabled by default.
         :param js_apis: Dict or DictJsBridge exposing Python functions to JavaScript
             via ``window.qtwebview.api``.
         :param user_data_folder: Path for persistent WebView2 user data (cache, cookies).
-            Defaults to Qt's AppLocalDataLocation.
-        :param incognito: Use incognito mode. No cache or cookies persisted.
-            Overrides *user_data_folder*.
+            Defaults to ``QStandardPaths.AppLocalDataLocation/QtWebView/``.
+            Pass ``None`` to skip setting a data directory — the browser engine may
+            still use its own default storage location.
+        :param incognito: Enable browser incognito / private mode.
+            Windows: requires WebView2 Runtime ≥ 101.0.1210.39.
         :param wsgi_app: A WSGI-compatible app (Flask, Bottle, Django, etc.). Requests
             are served via custom protocol (default scheme ``qtwebview://``) or localhost
             TCP if ``wsgi_scheme="localhost"``.
+        :param wsgi_scheme: Custom protocol scheme for WSGI. Default ``"qtwebview"``.
+            Use ``"localhost"`` to switch to a TCP server on 127.0.0.1 with auto port.
+            **Windows:** custom protocol URL conversion only applies at construction
+            time (via ``with_url``); subsequent ``load_url()`` calls do **not**
+            automatically convert custom scheme URLs.  Use *url* or *html* instead.
         :param wsgi_executor: If provided a thread pool executor,
             the WSGI App will be executed in the provided executor.
             If provided a number, the WSGI App will be executed in a thread pool executor
             with the specified number of threads. defaults to 8
-        :param wsgi_scheme: Custom protocol scheme for WSGI. Default ``"qtwebview"``.
-            Use ``"localhost"`` to switch to a TCP server on 127.0.0.1 with auto port.
+        :param wsgi_port: TCP port for localhost WSGI mode.  Default ``None``
+            (auto-assign).  Only used when ``wsgi_scheme="localhost"``.
+        :param proxy: Proxy configuration dict: ``{"type": "http"|"socks5",
+            "host": "...", "port": "..."}``.
+        :param back_forward_gestures: Enable two-finger swipe for back/forward
+            navigation.  Default False.
+        :param clipboard: Enable clipboard access (Windows/Linux).
+            macOS always enabled, regardless of this setting.  Default True.
+        :param https_scheme: Use ``https://`` instead of ``http://`` for custom
+            protocol pages (Windows only).  Makes the page a secure context,
+            enabling Service Workers, Geolocation, Web Crypto, etc.
+            Default ``True``.
+        :param context_menus: Enable native right-click context menu.
+            Windows only.  Default ``True``.
+        :param download_started_handler: Callable(url, suggested_path) → bool|str.
+            Return ``False`` to cancel download, or a new path to redirect.
+        :param download_completed_handler: Callable(url, saved_path, success: bool).
+            *saved_path* is ``None`` if cancelled.
         :param autoplay: Allow autoplay of media. Default False.
         :param javascript_enabled: Enable JavaScript. Default True.
-        :param hotkeys_zoom: Enable Ctrl+/- zoom. Default True.
-        :param drag_drop_handler: Callable(evt_type, paths, position) → bool.
+        :param hotkeys_zoom: Enable Ctrl+/- zoom.  Windows only.
+        :param initialization_script: JavaScript injected on every page load
+            (before any page scripts run).  Default: injects the JS bridge and
+            optionally fullscreen support.  Pass ``None`` to skip entirely, or
+            a string to inject custom JavaScript.  Setting this to ``None`` or a
+            custom string will break the JS bridge and fullscreen handling; you
+            must re-implement them manually if needed.
+        :param drag_drop_handler: Callable(:class:`DragDropEvent`, paths, position) → bool.
         :param native_child: If True, embed the WebView directly as a native child
             window instead of using an independent anchor window. Simpler,
             but the WebView dies with the parent HWND — avoid for system-tray apps.
@@ -167,15 +206,23 @@ class QtWebViewWidget(QWidget):
         else:
             raise TypeError("The wsgi_executor parameter must be a thread pool executor or an integer")
 
-        self._wsgi_port = None
+        self._wsgi_port = wsgi_port
         self._html = html
         self._headers = headers
         self._lazyload = lazyload
         self._user_data_folder = user_data_folder
         self._incognito = incognito
+        self._proxy = proxy
+        self._back_forward = back_forward_gestures
+        self._clipboard = clipboard
+        self._https_scheme = https_scheme
+        self._context_menus = context_menus
+        self._download_started_handler = download_started_handler
+        self._download_completed_handler = download_completed_handler
         self._autoplay = autoplay
         self._javascript_enabled = javascript_enabled
         self._hotkeys_zoom = hotkeys_zoom
+        self._init_script = initialization_script
         self._drag_drop_handler = drag_drop_handler
         self._native_child = native_child
         self._fullscreen_handler = (
@@ -184,7 +231,7 @@ class QtWebViewWidget(QWidget):
             else fullscreen_handler
         )
         self.navigation_handler = navigation_handler
-        self.newWindow_handler = new_window_handler
+        self.new_window_handler = new_window_handler
 
         # JS bridge
         if isinstance(js_apis, dict) or js_apis is None:
@@ -194,8 +241,7 @@ class QtWebViewWidget(QWidget):
         else:
             raise TypeError("js_apis must be a dict or DictJsBridge")
 
-        self.signals = QtWebViewSignals(self)
-        self.bridge = self.signals
+        self.bridge = self.signals = QtWebViewSignals(self)
 
         # ── Create webview (deferred to thread for fast startup) ──
         self._webview: Optional[WebView] = None
@@ -297,11 +343,17 @@ class QtWebViewWidget(QWidget):
 
     def _make_webview(self, hwnd: int) -> WebView:
         """Build the kwargs dict and create a WebView."""
-        import time as _time
-        _t0 = _time.perf_counter()
-        init_script = _JS_BRIDGE
-        if self._fullscreen_handler is not None:
-            init_script += _FULLSCREEN_JS
+        _t0 = time.perf_counter()
+        # Build initialization script
+        if self._init_script is _NOT_GIVEN:
+            # Default: inject JS bridge + fullscreen (if handler is set)
+            init_script = BRIDGE_SCRIPT
+            if self._fullscreen_handler is not None:
+                init_script += FULLSCREEN_SCRIPT
+        elif self._init_script is not None:
+            init_script = self._init_script
+        else:
+            init_script = None
 
         kwargs: dict = {
             "initialization_script": init_script,
@@ -311,25 +363,39 @@ class QtWebViewWidget(QWidget):
             "autoplay": self._autoplay,
             "javascript_enabled": self._javascript_enabled,
             "hotkeys_zoom": self._hotkeys_zoom,
+            "back_forward_gestures": self._back_forward,
+            "clipboard": self._clipboard,
+            "https_scheme": self._https_scheme,
+            "default_context_menus": self._context_menus,
         }
+
         if self._drag_drop_handler:
             kwargs["drag_drop_handler"] = self._drag_drop_handler
-        # Auto-generate cache directory unless incognito
-        if self._incognito:
-            if self._user_data_folder:
-                logger.warning("[%s] user_data_folder is ignored when incognito=True", self)
-        else:
-            data_dir = self._user_data_folder
-            if not data_dir:
-                data_dir = QStandardPaths.writableLocation(
-                    QStandardPaths.StandardLocation.AppLocalDataLocation
-                )
-                if data_dir:
-                    data_dir = f"{data_dir}/QtWebView/"
+        if self._download_started_handler:
+            kwargs["on_download_started"] = self._download_started_handler
+        if self._download_completed_handler:
+            kwargs["on_download_completed"] = self._download_completed_handler
+
+        # data_directory: three states via sentinel
+        #   _NOT_GIVEN  → auto-generate (default)
+        #   None        → no data directory
+        #   str         → user-specified path
+        if self._user_data_folder is _NOT_GIVEN:
+            data_dir = QStandardPaths.writableLocation(
+                QStandardPaths.StandardLocation.AppLocalDataLocation
+            )
+            if data_dir:
+                data_dir = f"{data_dir}/QtWebView/"
             logger.debug("[%s] WebView DataFolder: %s", self, data_dir)
             kwargs["data_directory"] = data_dir
+        else:
+            kwargs["data_directory"] = self._user_data_folder
+
+        logger.debug("[%s] WebView DataFolder: %s", self, kwargs.get('data_directory'))
+
         if self._user_agent:
             kwargs["user_agent"] = self._user_agent
+
         if self._bg_color:
             c = self._bg_color.lstrip("#")
             if len(c) == 6:
@@ -346,7 +412,7 @@ class QtWebViewWidget(QWidget):
                     def process_request(self, request, client_address):
                         _wsgi_executor.submit(self.process_request_thread, request, client_address)
 
-                server = make_server("127.0.0.1", 0, self._wsgi_app, server_class=ThreadedServer)
+                server = make_server("127.0.0.1", self._wsgi_port or 0, self._wsgi_app, server_class=ThreadedServer)
                 self._wsgi_port = server.server_port
                 threading.Thread(target=server.serve_forever, daemon=True).start()
                 logger.info("[%s] WSGI on http://127.0.0.1:%d", self, self._wsgi_port)
@@ -365,21 +431,19 @@ class QtWebViewWidget(QWidget):
         )[1]
         kwargs["on_new_window"] = lambda url: (
             self.bridge.new_window_requested.emit(url),
-            self.newWindow_handler(url) if self.newWindow_handler else "allow"
+            self.new_window_handler(url) if self.new_window_handler else NewWindowResponse.Allow
         )[1]
 
+        if self._proxy:
+            kwargs["proxy"] = self._proxy
         if self._html:
             kwargs["html"] = self._html
-        if self._user_data_folder:
-            kwargs["data_directory"] = self._user_data_folder
-
-        if self._wsgi_port:
+        if self._url:
+            kwargs["url"] = self._url
+        elif self._wsgi_port:
             kwargs["url"] = f"http://127.0.0.1:{self._wsgi_port}/"
         elif self._wsgi_scheme:
             kwargs["url"] = f"{self._wsgi_scheme}://localhost/"
-        elif self._url:
-            kwargs["url"] = self._url
-
         if self._headers:
             kwargs["headers"] = self._headers
 
@@ -392,7 +456,7 @@ class QtWebViewWidget(QWidget):
 
         wv = WebView(hwnd, **kwargs)
         logger.debug("[%s] WebView created in %.0fms",
-                     self, (_time.perf_counter() - _t0) * 1000)
+                     self, (time.perf_counter() - _t0) * 1000)
         return wv
 
     def _flush_pending(self):
@@ -425,10 +489,6 @@ class QtWebViewWidget(QWidget):
                     self._fullscreen_handler(enter)
                 return
 
-            if func_name == "call":
-                func_name = params[0] if params else ""
-                params = params[1:] if len(params) > 1 else []
-
             if not func_name or not call_id:
                 return
 
@@ -443,7 +503,6 @@ class QtWebViewWidget(QWidget):
                 logger.error("[%s] JS API '%s' error: %s", self, func_name, e, exc_info=True)
                 self._return_js_error(repr(e), call_id)
         except (json.JSONDecodeError, KeyError, TypeError):
-            self.signals.web_message_received.emit(msg)
             logger.debug("Raw IPC: %.200s", msg)
 
     def _return_to_js(self, result: Any, call_id: str):
@@ -587,6 +646,11 @@ class QtWebViewWidget(QWidget):
         """Close the browser DevTools window."""
         self._webview.close_devtools()
 
+    @_require_webview(error_if_not_ready=True)
+    def is_devtools_open(self) -> bool:
+        """Return True if DevTools is currently open."""
+        return self._webview.is_devtools_open()
+
     @_require_webview()
     def zoom(self, scale: float):
         """Set zoom level (1.0 = 100%)."""
@@ -623,6 +687,8 @@ class QtWebViewWidget(QWidget):
 
     def closeEvent(self, event):
         logger.debug("[%s] closing", self)
+        # Drop webview first (child HWND must outlive parent),
+        # then tear down the anchor window that hosted it.
         self._webview = None
         if self._anchor:
             self._anchor.deleteLater()

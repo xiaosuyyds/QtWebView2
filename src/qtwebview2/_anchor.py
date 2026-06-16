@@ -92,14 +92,8 @@ class _AnchorWindow(QWidget):
         self._fill_timer = QTimer(self)
         self._fill_timer.setSingleShot(True)
         self._fill_timer.timeout.connect(self._fill_layered)
-
-    def showEvent(self, event):
-        super().showEvent(event)
-        # When the window is hidden and shown again, the DWM discards the
-        # layered surface.  A WM_SIZE may not fire (the size didn't change),
-        # so we force an immediate update to restore the alpha=1 surface.
-        if sys.platform == "win32":
-            self._fill_layered()
+        # Release GDI objects when the widget is destroyed
+        self.destroyed.connect(self._cleanup_gdi)
 
     # ── Win32 message handling ──────────────────────────────────────────
 
@@ -128,6 +122,15 @@ class _AnchorWindow(QWidget):
             # theme toggle, DWM restart).  The layered surface may
             # have been discarded — repaint immediately.
             self._fill_layered()
+        elif msg.message == 0x0018:  # WM_SHOWWINDOW
+            # Re-show after hide: the DWM discards the layered surface
+            # on hide.  The DWM runs in a separate process and processes
+            # show commands asynchronously — there is no Win32 message
+            # that signals completion.  We reuse the existing 33 ms
+            # throttled fill timer (also used by WM_SIZE) to defer
+            # UpdateLayeredWindow until the DWM has settled.
+            if msg.wParam == 1:
+                self._fill_timer.start(33)
 
         return False, 0
 
@@ -212,3 +215,20 @@ class _AnchorWindow(QWidget):
             hwnd, scrdc, None, ctypes.byref(SIZE(w, h)),
             mdc, ctypes.byref(POINT(0, 0)),
             0, ctypes.byref(blend), 0x00000002)  # 0x00000002 = ULW_ALPHA
+
+    # ── GDI cleanup ────────────────────────────────────────────────────────
+
+    def _cleanup_gdi(self):
+        """Release cached GDI objects (Screen DC, Memory DC, DIB Section).
+
+        Connected to :meth:`QObject.destroyed` so the resources are freed
+        even when the widget is closed via ``deleteLater()``."""
+        cache = getattr(self, '_ulw_cache', None)
+        if cache is None:
+            return
+        import ctypes
+        ctypes.windll.gdi32.SelectObject(cache['dc'], cache['old'])
+        ctypes.windll.gdi32.DeleteObject(cache['bmp'])
+        ctypes.windll.gdi32.DeleteDC(cache['dc'])
+        ctypes.windll.user32.ReleaseDC(0, cache['scrdc'])
+        self._ulw_cache = None

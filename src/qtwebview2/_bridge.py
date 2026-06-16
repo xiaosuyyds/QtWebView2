@@ -9,6 +9,7 @@ import typing
 from typing import Callable, Any, Optional, Union
 from typing_extensions import deprecated
 from qtpy.QtCore import QObject, Signal
+from wryview import PageLoadEvent
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -19,7 +20,7 @@ class QtWebViewSignals(QObject):
     """Signals emitted by QtWebViewWidget."""
     # WebView events
     initialization_done = Signal()
-    page_loaded = Signal(str, str)  # (event: "Started"|"Finished", url)
+    page_loaded = Signal(PageLoadEvent, str)  # (event, url)
     title_changed = Signal(str)  # (title)
     navigation_requested = Signal(str)  # (url)
     new_window_requested = Signal(str)  # (url)
@@ -78,7 +79,7 @@ class DictJsBridge:
 # JavaScript payloads injected into every WebView
 # ═══════════════════════════════════════════════════════════════════════════════
 
-_JS_BRIDGE = """
+BRIDGE_SCRIPT = """
 (function() {
     if (window.qtwebview || window.qtwebview2) return;
     var pending = {};
@@ -94,8 +95,12 @@ _JS_BRIDGE = """
         api: new Proxy({}, {
             get: function(target, prop) {
                 return function() {
-                    var callId = genId();
                     var args = Array.prototype.slice.call(arguments);
+                    // meta-call: api.call("funcName", ...args) → api["funcName"](...args)
+                    if (prop === 'call') {
+                        return target.api[args[0]].apply(null, args.slice(1));
+                    }
+                    var callId = genId();
                     return new Promise(function(resolve, reject) {
                         pending[callId] = {resolve: resolve, reject: reject};
                         window.ipc.postMessage(JSON.stringify({
@@ -111,26 +116,23 @@ _JS_BRIDGE = """
     window.addEventListener('qtwebview-response', function(e) {
         if (!e.detail) return;
         var data = typeof e.detail === 'string' ? JSON.parse(e.detail) : e.detail;
-        for (var id in pending) {
-            if (data.id === id || (data.result !== undefined && pending[id])) {
-                pending[id].resolve(data.result);
-                delete pending[id];
-                return;
-            }
-            if (data.error) {
+        var id = data.id;
+        if (id && pending[id]) {
+            if (data.error !== undefined) {
                 pending[id].reject(new Error(data.error));
-                delete pending[id];
-                return;
+            } else {
+                pending[id].resolve(data.result);
             }
+            delete pending[id];
         }
     });
 })();
 """
 
-_FULLSCREEN_JS = """
+FULLSCREEN_SCRIPT = """
 (function() {
-    if (Element.prototype.hasOwnProperty('_qtwebview_fs')) return;
-    Object.defineProperty(Element.prototype, '_qtwebview_fs', {value: true});
+    if (Object.hasOwn(Element.prototype, '_qtwebview_fs')) return;
+    Object.defineProperty(Element.prototype, '_qtwebview_fs', {value: true, writable: false, configurable: false});
 
     var _origReqFS = Element.prototype.requestFullscreen;
     var _origExitFS = Document.prototype.exitFullscreen;

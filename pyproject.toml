@@ -9,7 +9,7 @@ authors = [
 ]
 description = "A lightweight and powerful cross-platform webview widget for Python Qt (PySide/PyQt), powered by wry."
 readme = "README.md"
-version = "0.6.0rc6"
+version = "0.6.0rc7"
 requires-python = ">=3.10"
 license = "MPL-2.0"
 license-files = ["LICENSE"]
@@ -29,7 +29,6 @@ classifiers = [
     # Operating System
     "Operating System :: Microsoft :: Windows",
     "Operating System :: MacOS",
-    "Operating System :: POSIX :: Linux",
 
     # Intended Audience & Topic
     "Intended Audience :: Developers",
@@ -38,7 +37,7 @@ classifiers = [
 ]
 dependencies = [
     "qtpy~=2.0",
-    "wryview~=0.3.2",
+    "wryview~=0.4.0",
     "typing-extensions~=4.13"
 ]
 

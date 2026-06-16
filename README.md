@@ -73,7 +73,7 @@ Expose Python functions to JavaScript with `DictJsBridge`. JS calls Python via
 import sys
 from qtpy.QtWidgets import QApplication, QVBoxLayout, QWidget
 from qtpy.QtCore import Slot, QCoreApplication
-from qtwebview2 import QtWebViewWidget, DictJsBridge
+from qtwebview2 import QtWebViewWidget, DictJsBridge, PageLoadEvent
 
 # Set an application name so the user data folder path stays stable
 QCoreApplication.setApplicationName("QtWebView-Demo")
@@ -129,9 +129,9 @@ webview.load_html(html_content)
 
 
 # 6. Python -> JS: Execute JavaScript after page loads
-@Slot(str, str)
+@Slot(PageLoadEvent, str)
 def on_page_loaded(evt, url):
-    if evt == "Finished":
+    if evt == PageLoadEvent.Finished:
         webview.evaluate_js("""(function() {
             const new_element = document.createElement('h2');
             new_element.textContent = 'Hello from Python!';
@@ -341,49 +341,63 @@ def closeEvent(self, event):
 from qtwebview2 import QtWebView2Widget    from qtwebview2 import QtWebViewWidget
 webview = QtWebView2Widget(url=...)        webview = QtWebViewWidget(url=...)
 
-# Parameters with different names:
-# handle_new_window=True/False   → new_window_handler=lambda url: "allow"|"deny"
+# Parameters with different names / behaviour:
+# handle_new_window=True/False   → new_window_handler=lambda url: NewWindowResponse.Deny
 # wsgi_host_name="myapp.local"   → wsgi_scheme="qtwebview"
 # browser_executable_folder=...  → (not supported by wry)
 # fullscreen_support=True        → fullscreen_handler=your_handler
-# no_local_storage=True          → (removed, use incognito=True)
-
-# Removed parameters (no equivalent):
-# context_menus, init_settings_hook
+# no_local_storage=True          → user_data_folder=None (skip data directory)
+# init_settings_hook             → (removed, no equivalent)
 
 # New parameters in v0.6.0:
 # html, headers, navigation_handler, incognito, autoplay,
 # javascript_enabled, hotkeys_zoom, drag_drop_handler,
-# js_apis, wsgi_executor, fullscreen_handler, parent, native_child
+# js_apis, wsgi_executor, fullscreen_handler, parent, native_child,
+# proxy, clipboard, https_scheme, download_started_handler,
+# download_completed_handler, wsgi_port
 ```
 
 ## 📦 API Overview
 
 ```python
+from qtwebview2 import NewWindowResponse, DragDropEvent, PageLoadEvent
+
 webview = QtWebViewWidget(
-    url="https://example.com",           # initial URL
-    html="<h1>Hello</h1>",               # or initial HTML
-    headers={"Authorization": "Bearer"},  # custom HTTP headers
+    url="https://example.com",              # initial URL
+    html="<h1>Hello</h1>",                  # or initial HTML
+    headers={"Authorization": "Bearer"},     # custom HTTP headers
     user_agent="CustomAgent/1.0",
-    debug=True,                            # DevTools on
+    debug=True,                              # DevTools on
     transparent=False,
     background_color="#1e1e1e",
-    navigation_handler=lambda url: True,   # return False to block
-    new_window_handler=lambda url: "allow",
-    lazyload=True,                         # defer to showEvent
-    js_apis=DictJsBridge(),               # JS API bridge
+    navigation_handler=lambda url: True,     # return False to block
+    new_window_handler=lambda url: NewWindowResponse.Deny,
+    lazyload=True,                           # defer to showEvent
+    js_apis=DictJsBridge(),                 # JS API bridge
+    user_data_folder="/path/to/cache",      # auto-generated if omitted,
+                                            # pass None to skip
     incognito=False,
-    user_data_folder="/path/to/cache",
     wsgi_app=flask_app,
     wsgi_scheme="qtwebview",
-    wsgi_executor=8,                       # WSGI thread pool size
+    wsgi_executor=8,                         # WSGI thread pool size
+    wsgi_port=None,                          # localhost TCP port (auto)
+    proxy={"type": "http", "host": "127.0.0.1", "port": "8080"},
+    back_forward_gestures=False,
+    clipboard=True,                          # Windows/Linux only
+    https_scheme=True,                       # secure context for protocols
+    context_menus=True,                      # native right-click menu
+    download_started_handler=lambda url, path: True,
+    download_completed_handler=lambda url, path, ok: None,
     autoplay=False,
     javascript_enabled=True,
-    hotkeys_zoom=True,
-    drag_drop_handler=lambda evt, paths, pos: True,
-    fullscreen_handler=lambda enter: ...,  # custom fullscreen behavior
-    native_child=False,                    # anchor window mode
-    parent=self,                           # parent QWidget
+    hotkeys_zoom=True,                       # Windows only
+    initialization_script=None,              # None = no injected script,
+                                            # omit = default bridge+fullscreen,
+                                            # str = custom script
+    drag_drop_handler=lambda evt: DragDropEvent,
+    fullscreen_handler=lambda enter: ...,    # custom fullscreen behavior
+    native_child=False,                      # anchor window mode
+    parent=self,                             # parent QWidget
 )
 
 webview.load_url(url)                     # Navigate
@@ -399,6 +413,7 @@ webview.set_cookie(name, value)           # Set cookie
 webview.delete_cookie(name, url)          # Delete cookie
 webview.open_devtools()                   # Open DevTools
 webview.close_devtools()                  # Close DevTools
+webview.is_devtools_open()                # Check DevTools state
 webview.zoom(1.5)                         # Zoom 150%
 webview.print()                           # Print page
 webview.focus()                           # Focus webview
@@ -406,7 +421,7 @@ webview.set_background_color(r, g, b, a)  # Set background color
 webview.clear_all_browsing_data()         # Clear cache
 
 # Signals
-webview.signals.page_loaded.connect(lambda evt, url: ...)
+webview.signals.page_loaded.connect(lambda evt, url: ...)        # evt is PageLoadEvent
 webview.signals.title_changed.connect(lambda title: ...)
 webview.signals.navigation_requested.connect(lambda url: ...)
 webview.signals.new_window_requested.connect(lambda url: ...)
