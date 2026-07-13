@@ -275,11 +275,10 @@ class QtWebViewWidget(QWidget):
             self._start_webview_anchor()
 
     def _start_webview_anchor(self):
-        """Create independent transparent QWidget, embed via fromWinId + container."""
-        self._anchor = _AnchorWindow()
+        """Create the transparent QWindow host, embed it via createWindowContainer."""
+        self._anchor = _AnchorWindow(transparent=self._transparent)
         hwnd = int(self._anchor.winId())
-        view = QWindow.fromWinId(hwnd)
-        self._container = QWidget.createWindowContainer(view, self)
+        self._container = QWidget.createWindowContainer(self._anchor, self)
         layout = self.layout()
         if layout is None:
             layout = QVBoxLayout(self)

@@ -41,6 +41,12 @@ pip install qtwebview2
 pip install pyside6    # or pyqt6
 ```
 
+> **Transparency note (Windows):** `transparent=True` is backed by a Qt RHI
+> DirectComposition surface, which needs **PySide6** (the only binding that
+> exposes `QRhi`) on **Windows 8+**. Under PyQt6 / PyQt5 / PySide2 the library
+> still imports and runs, but the host falls back to an **opaque** background and
+> logs a warning. macOS is unaffected.
+
 ## 🧑‍💻 Usage
 
 ### Basic

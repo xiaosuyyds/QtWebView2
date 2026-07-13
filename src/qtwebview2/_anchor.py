@@ -2,222 +2,251 @@
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 """
+``_AnchorWindow`` — host ``QWindow`` for the WebView child HWND.
 
-``_AnchorWindow`` — top-level transparent host for the WebView child HWND.
-
-On Windows the window is made layered (per-pixel alpha via
-``WS_EX_LAYERED``) to fill newly-exposed pixels with alpha=1 during
-resize — eliminating the black-edge flicker the DWM would otherwise
-produce when the layered surface is extended.
-
-See the class docstring for a detailed rationale.
+On Windows the host is backed by a Qt RHI Direct3D 11 swapchain that clears to a
+fully transparent colour, giving a ``transparent=True`` WebView a real surface to
+composite over and absorbing the black-edge flash wry produces while resizing.
+See the class docstring for the full rationale.
 """
 from __future__ import annotations
 
 import ctypes
+import logging
+import os
 import sys
-from ctypes import wintypes
 
-from qtpy.QtCore import Qt, QTimer
-from qtpy.QtWidgets import QWidget
+from qtpy.QtCore import QSize, QEvent, Qt
+from qtpy.QtGui import QWindow, QColor, QSurfaceFormat, QPlatformSurfaceEvent
 
+# QRhi is Qt's rendering-hardware-interface — the backend for the transparent
+# host on Windows.  It is Qt6-only and, among the Qt6 bindings, currently exposed
+# only by PySide6.  Import it defensively so ``import qtwebview2`` still succeeds
+# under PyQt5/PyQt6/PySide2: without it the host silently falls back to an opaque
+# plain QWindow (a warning is logged at construction, see ``_AnchorWindow``).
+try:
+    from qtpy.QtGui import (
+        QRhi, QRhiSwapChain, QRhiRenderBuffer,
+        QRhiD3D11InitParams, QRhiDepthStencilClearValue,
+    )
+    _HAS_QRHI = True
+except ImportError:
+    _HAS_QRHI = False
 
-# ── ctypes structures ──
-class _BITMAPINFOHEADER(ctypes.Structure):
-    _fields_ = [
-        ("biSize", ctypes.c_uint32),
-        ("biWidth", ctypes.c_int32),
-        ("biHeight", ctypes.c_int32),
-        ("biPlanes", ctypes.c_uint16),
-        ("biBitCount", ctypes.c_uint16),
-        ("biCompression", ctypes.c_uint32),
-        ("biSizeImage", ctypes.c_uint32),
-        ("biXPelsPerMeter", ctypes.c_int32),
-        ("biYPelsPerMeter", ctypes.c_int32),
-        ("biClrUsed", ctypes.c_uint32),
-        ("biClrImportant", ctypes.c_uint32),
-    ]
+logger = logging.getLogger(__name__)
 
+# Undocumented Qt env var.  The Windows QPA plugin reads it at native-window
+# ``create()`` time and, when set, creates the HWND with WS_EX_NOREDIRECTIONBITMAP
+# — the flag that lets Qt build a DirectComposition transparent swapchain.
+_ENV_DISABLE_REDIRECTION = "QT_QPA_DISABLE_REDIRECTION_SURFACE"
 
-class _BLENDFUNCTION(ctypes.Structure):
-    _fields_ = [
-        ("BlendOp", ctypes.c_byte),
-        ("BlendFlags", ctypes.c_byte),
-        ("SourceConstantAlpha", ctypes.c_byte),
-        ("AlphaFormat", ctypes.c_byte),
-    ]
+# Win32 constants — used only to verify the ex-style flag after creation.
+_GWL_EXSTYLE = -20
+_WS_EX_NOREDIRECTIONBITMAP = 0x00200000
 
 
-class _POINT(ctypes.Structure):
-    _fields_ = [("x", ctypes.c_int32), ("y", ctypes.c_int32)]
-
-
-class _SIZE(ctypes.Structure):
-    _fields_ = [("cx", ctypes.c_int32), ("cy", ctypes.c_int32)]
-
-
-_RECT = ctypes.c_uint32 * 4  # left, top, right, bottom
-
-# Pre-allocated constant structures
-_BLEND = _BLENDFUNCTION(0, 0, 255, 1)  # AC_SRC_OVER, use per-pixel alpha
-_ZERO_POINT = _POINT(0, 0)
-
-
-class _AnchorWindow(QWidget):
+class _AnchorWindow(QWindow):
     """
-    Top-level window that hosts the WebView child HWND.
+    Host ``QWindow`` that the WebView child HWND is parented into.
 
     **Why this class exists**
 
-    Windows WebView2 resizing produces a black-edge flicker.  The flicker
-    comes from the DWM layered surface being extended before any new
-    content is submitted — the DWM fills the new area with transparent
-    black, which the user sees as a brief black flash at the window edge.
+    A ``transparent=True`` WebView needs whatever sits *behind* it (the Qt
+    content) to actually show through, and wry's resize produces a black-edge
+    flash at newly-exposed pixels.  Both are solved by giving the host a genuine
+    transparent surface: an empty window has nothing for the DWM to composite and
+    comes out black instead.
 
-    The known fix is per-pixel alpha: fill every pixel of the layered
-    surface with alpha=1 (visually transparent, but alpha>0 tells the
-    DWM the pixel belongs to this window → hit-test passes).  Qt provides
-    this via ``WA_TranslucentBackground`` + ``paintEvent``, but
-    ``createWindowContainer`` suppresses *paintEvent* on the embedded
-    window, so newly-exposed areas never receive the alpha=1 fill during
-    resize.
+    **How this class works (Windows)**
 
-    **How this class works around it**
+    The host is a ``QWindow`` with ``surfaceType = Direct3DSurface`` and an
+    alpha-enabled format.  A Qt RHI Direct3D 11 swapchain
+    (``SurfaceHasPreMulAlpha``) is attached to it; Qt then builds the whole
+    DirectComposition chain for us — ``DCompositionCreateDevice`` →
+    ``CreateTargetForHwnd`` → ``CreateVisual`` →
+    ``CreateSwapChainForComposition`` (``DXGI_ALPHA_MODE_PREMULTIPLIED``) →
+    ``SetContent``/``SetRoot`` → ``Commit`` — none of which we write by hand.
 
-    1. ``WA_TranslucentBackground`` — Qt creates the window with
-       ``WS_EX_LAYERED`` and handles the *initial* layered surface setup.
+    Each frame clears the swapchain to ``(0, 0, 0, 0)``.  The DWM composites that
+    transparent surface, so uncovered areas show the Qt content behind the host
+    instead of black, and there is no redirection surface to flash on resize.  The
+    WebView child HWND renders on top (airspace) and receives input as usual.
 
-    2. ``nativeEvent`` catches ``WM_SIZE`` — during a resize the window's
-       layered surface is extended by the DWM (new area = alpha=0).  We
-       schedule a deferred fill via a single-shot throttling timer at
-       ~20 fps (50 ms).  The timer is restarted on every ``WM_SIZE``,
-       so during an active resize gesture (60–120 WM_SIZE/sec) the fill
-       is deferred indefinitely — the layered surface is NOT updated
-       mid-resize.  This avoids DWM re-composition flicker from competing
-       with the resize itself.  ``WM_EXITSIZEMOVE`` (0x0232) triggers an
-       immediate fill for the final frame.
+    The render loop is driven by ``exposeEvent`` and only runs on expose/resize —
+    the content never changes, so there is no per-frame spin.
 
-    3. A periodic 500 ms refresh timer runs whenever the window is visible
-       as a safety net for edge cases where a needed repaint is not
-       triggered by any window message (e.g. DWM composition events).
+    **Caveats**
 
-    4. The bitmap is filled with BGRA ``(0, 0, 0, 1)`` — premultiplied
-       alpha where every pixel has alpha=1.  The DWM does per-pixel
-       hit-testing: alpha>0 means the pixel belongs to this window, so
-       clicks are registered even though the pixel is visually transparent
-       (1/255 opacity).
-
-    **Why not use ``WA_TranslucentBackground`` + ``repaint()``?**
-
-    ``createWindowContainer`` stops ``paintEvent`` (and ``WM_PAINT``)
-    from reaching the embedded window for newly-exposed areas.  Calling
-    ``repaint()``, ``update()``, or even direct QPainter painting has no
-    effect — Qt's internal foreign-window integration simply does not
-    route those paint operations to the layered surface.  The only
-    reliable path is to call ``UpdateLayeredWindow`` ourselves.
+    * Windows 8+ (DirectComposition / flip swapchain).  The project's WebView2
+      baseline (Win10/11) covers this.
+    * Requires a Qt binding exposing ``QRhi`` (**PySide6**).  Under any other
+      binding the RHI path is skipped and the host is an opaque plain ``QWindow``
+      (transparency + resize-flicker suppression disabled; a warning is logged).
+    * On macOS the RHI path is skipped: the host stays a plain ``QWindow`` and
+      WKWebView handles transparency itself.
     """
 
-    def __init__(self):
-        super().__init__(None)
-        self.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self.setWindowFlags(
-            Qt.WindowType.Tool
-            | Qt.WindowType.FramelessWindowHint
-        )
-        # Single-shot timer for WM_SIZE throttling
-        self._fill_timer = QTimer(self)
-        self._fill_timer.setSingleShot(True)
-        self._fill_timer.timeout.connect(self._fill_layered)
-        # Periodic refresh — safety net for missed/dropped repaint events
-        self._refresh_timer = QTimer(self)
-        self._refresh_timer.setInterval(500)
-        self._refresh_timer.timeout.connect(self._fill_layered)
+    def __init__(self, transparent: bool = False):
+        super().__init__()
+        self._use_rhi = sys.platform == "win32" and _HAS_QRHI
+        if sys.platform == "win32" and not _HAS_QRHI:
+            logger.warning(
+                "[anchor] QRhi is unavailable in the current Qt binding — the "
+                "transparent WebView host requires PySide6 on Windows.  Falling "
+                "back to an opaque host; transparency and resize-flicker "
+                "suppression are disabled.%s",
+                "  (transparent=True was requested)" if transparent else "",
+            )
 
-    def showEvent(self, event):
-        super().showEvent(event)
-        self._refresh_timer.start()
+        # RHI swapchain state (Windows only; all None/False until first expose).
+        self._rhi = None
+        self._sc = None
+        self._ds = None
+        self._rp = None
+        self._has_sc = False
+        self._initialized = False
+        self._not_exposed = False
+        self._newly_exposed = False
 
-    def hideEvent(self, event):
-        super().hideEvent(event)
-        self._refresh_timer.stop()
+        # Must be set *before* create(): this QWindow is realised while still
+        # top-level, then embedded via createWindowContainer as a WS_CHILD.  A
+        # framed top-level window carries Win32 frame margins (title bar + border);
+        # on reparent Qt subtracts those margins from the child position, shifting
+        # the HWND up-and-left so the WebView intrudes over whatever sits above it
+        # (e.g. a toolbar).  Frameless zeroes the margins → the child lands exactly
+        # on its container.
+        self.setFlags(self.flags() | Qt.WindowType.FramelessWindowHint)
 
-    # ── Win32 message handling ──────────────────────────────────────────
+        if self._use_rhi:
+            # Alpha-enabled Direct3D surface + create() under
+            # WS_EX_NOREDIRECTIONBITMAP → Qt gives us the DirectComposition
+            # transparent swapchain described in the class docstring.
+            self.setSurfaceType(QWindow.SurfaceType.Direct3DSurface)
+            fmt = QSurfaceFormat()
+            fmt.setAlphaBufferSize(8)
+            self.setFormat(fmt)
+            self._create_no_redirection()
 
-    def nativeEvent(self, eventType, message):
-        if sys.platform != "win32":
-            return False, 0
-        if eventType != b"windows_generic_MSG":
-            return False, 0
+    # ── native window creation ───────────────────────────────────────────────
 
-        msg = ctypes.cast(int(message), ctypes.POINTER(wintypes.MSG)).contents
+    def _create_no_redirection(self):
+        """Realise the native HWND now, with WS_EX_NOREDIRECTIONBITMAP.
 
-        if msg.message == 0x0005:  # WM_SIZE
-            # Throttle: restart the 50 ms timer.  If the user keeps
-            # dragging, the timer never fires and we don't flood the
-            # DWM with UpdateLayeredWindow calls.
-            self._fill_timer.start(50)
-        elif msg.message == 0x0232:  # WM_EXITSIZEMOVE
-            # Resize gesture ended — stop the timer and paint immediately
-            # so the final frame is guaranteed correct.
-            self._fill_timer.stop()
-            self._fill_layered()
-            self._fill_timer.start(50)
-        elif msg.message == 0x031E:  # WM_DWMCOMPOSITIONCHANGED
-            # DWM composition state changed (RDP connect/disconnect,
-            # theme toggle, DWM restart).  The layered surface may
-            # have been discarded — repaint immediately.
-            self._fill_layered()
-        elif msg.message == 0x0018:  # WM_SHOWWINDOW
-            # Re-show after hide: the DWM discards the layered surface
-            # on hide.  The DWM runs in a separate process and processes
-            # show commands asynchronously — there is no Win32 message
-            # that signals completion.  We reuse the existing 50 ms
-            # throttled fill timer (also used by WM_SIZE) to defer
-            # UpdateLayeredWindow until the DWM has settled.
-            if msg.wParam == 1:
-                self._fill_timer.stop()
-                self._fill_layered()
-                self._fill_timer.start(50)
+        Done by toggling ``QT_QPA_DISABLE_REDIRECTION_SURFACE`` around
+        ``create()``, then restoring it so no other window inherits the flag.
+        """
+        prev = os.environ.get(_ENV_DISABLE_REDIRECTION)
+        os.environ[_ENV_DISABLE_REDIRECTION] = "1"
+        try:
+            self.create()
+        finally:
+            if prev is None:
+                os.environ.pop(_ENV_DISABLE_REDIRECTION, None)
+            else:
+                os.environ[_ENV_DISABLE_REDIRECTION] = prev
 
-        return False, 0
-
-    # ── Per-pixel alpha surface update ───────────────────────────────────
-
-    def _fill_layered(self):
-        """Create a 32-bit BGRA DIB section, fill every pixel
-        with ``(B=0, G=0, R=0, A=1)``, and submit it via
-        ``UpdateLayeredWindow`` with ``ULW_ALPHA``."""
         hwnd = int(self.winId())
-        rect = _RECT()
-        ctypes.windll.user32.GetClientRect(hwnd, rect)
-        w, h = rect[2], rect[3]  # right, bottom
-        if w <= 0 or h <= 0:
+        ex = ctypes.windll.user32.GetWindowLongW(hwnd, _GWL_EXSTYLE) & 0xFFFFFFFF
+        logger.info("[anchor] hwnd=0x%X NOREDIRECTIONBITMAP=%s",
+                    hwnd, bool(ex & _WS_EX_NOREDIRECTIONBITMAP))
+
+    # ── event-driven render loop (mirrors Qt's rhiwindow example) ─────────────
+
+    def exposeEvent(self, event):
+        if not self._use_rhi:
             return
 
-        bih = _BITMAPINFOHEADER()
-        bih.biSize = ctypes.sizeof(_BITMAPINFOHEADER)
-        bih.biWidth = w
-        bih.biHeight = -h  # negative → top-down DIB (origin at top-left)
-        bih.biPlanes = 1
-        bih.biBitCount = 32  # BGRA, 8 bits per channel
+        # Lazily bring up the RHI + swapchain on first real expose.
+        if self.isExposed() and not self._initialized:
+            self._init_rhi()
+            self._resize_swapchain()
+            self._initialized = True
 
-        scrdc = ctypes.windll.user32.GetDC(0)
-        mdc = ctypes.windll.gdi32.CreateCompatibleDC(scrdc)
-        pBits = ctypes.c_void_p()
-        hbmp = ctypes.windll.gdi32.CreateDIBSection(
-            mdc, ctypes.byref(bih), 0, ctypes.byref(pBits), None, 0)
-        old_bmp = ctypes.windll.gdi32.SelectObject(mdc, hbmp)
+        surface_size = self._sc.surfacePixelSize() if self._has_sc else QSize()
 
-        # Fill: premultiplied alpha BGRA (B=0, G=0, R=0, A=1).
-        ctypes.memmove(pBits, b'\x00\x00\x00\x01' * (w * h), w * h * 4)
+        # Track transitions into/out of the "not exposed" (minimised/zero-size)
+        # state so the next real expose forces a swapchain resize.
+        if ((not self.isExposed() or (self._has_sc and surface_size.isEmpty()))
+                and self._initialized and not self._not_exposed):
+            self._not_exposed = True
 
-        ctypes.windll.user32.UpdateLayeredWindow(
-            hwnd, scrdc, None, ctypes.byref(_SIZE(w, h)),
-            mdc, ctypes.byref(_ZERO_POINT),
-            0, ctypes.byref(_BLEND), 0x00000002)  # 0x00000002 = ULW_ALPHA
+        if (self.isExposed() and self._initialized and self._not_exposed
+                and not surface_size.isEmpty()):
+            self._not_exposed = False
+            self._newly_exposed = True
 
-        ctypes.windll.gdi32.SelectObject(mdc, old_bmp)
-        ctypes.windll.gdi32.DeleteObject(hbmp)
-        ctypes.windll.user32.ReleaseDC(0, scrdc)
-        ctypes.windll.gdi32.DeleteDC(mdc)
+        if self.isExposed() and not surface_size.isEmpty():
+            self._render()
+
+    def event(self, e):
+        if self._use_rhi:
+            if e.type() == QEvent.Type.UpdateRequest:
+                self._render()
+            elif e.type() == QEvent.Type.PlatformSurface:
+                if (e.surfaceEventType()
+                        == QPlatformSurfaceEvent.SurfaceEventType.SurfaceAboutToBeDestroyed):
+                    self._release_swapchain()
+        return super().event(e)
+
+    # ── RHI setup / teardown ─────────────────────────────────────────────────
+
+    def _init_rhi(self):
+        params = QRhiD3D11InitParams()
+        self._rhi = QRhi.create(QRhi.Implementation.D3D11, params)
+        if self._rhi is None:
+            logger.error("[anchor] QRhi D3D11 create failed — host will not be transparent")
+            self._use_rhi = False
+            return
+
+        self._sc = self._rhi.newSwapChain()
+        self._ds = self._rhi.newRenderBuffer(
+            QRhiRenderBuffer.Type.DepthStencil, QSize(), 1,
+            QRhiRenderBuffer.Flag.UsedWithSwapChainOnly)
+        self._sc.setWindow(self)
+        self._sc.setDepthStencil(self._ds)
+        # SurfaceHasPreMulAlpha → Qt takes the DirectComposition transparent path.
+        self._sc.setFlags(QRhiSwapChain.Flag.SurfaceHasPreMulAlpha)
+        self._rp = self._sc.newCompatibleRenderPassDescriptor()
+        self._sc.setRenderPassDescriptor(self._rp)
+        logger.info("[anchor] QRhi D3D11 transparent swapchain initialised")
+
+    def _resize_swapchain(self):
+        self._has_sc = self._sc.createOrResize()
+
+    def _release_swapchain(self):
+        if self._has_sc:
+            self._has_sc = False
+            self._sc.destroy()
+
+    # ── frame rendering ──────────────────────────────────────────────────────
+
+    def _render(self):
+        if not self._has_sc or self._not_exposed:
+            return
+
+        # Resize the swapchain if the surface changed or we just came back.
+        if (self._sc.currentPixelSize() != self._sc.surfacePixelSize()
+                or self._newly_exposed):
+            self._resize_swapchain()
+            if not self._has_sc:
+                return
+            self._newly_exposed = False
+
+        result = self._rhi.beginFrame(self._sc)
+        if result == QRhi.FrameOpResult.FrameOpSwapChainOutOfDate:
+            self._resize_swapchain()
+            if not self._has_sc:
+                return
+            result = self._rhi.beginFrame(self._sc)
+        if result != QRhi.FrameOpResult.FrameOpSuccess:
+            self.requestUpdate()
+            return
+
+        cb = self._sc.currentFrameCommandBuffer()
+        rt = self._sc.currentFrameRenderTarget()
+        # Clear to fully transparent; draw nothing.
+        cb.beginPass(rt, QColor(0, 0, 0, 0), QRhiDepthStencilClearValue(1.0, 0))
+        cb.endPass()
+        self._rhi.endFrame(self._sc)
+        # Static content: no unconditional requestUpdate(), so the GPU does not
+        # spin at vsync — we only redraw on expose/resize.

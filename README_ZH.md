@@ -41,6 +41,11 @@ pip install qtwebview2
 pip install pyside6    # 或 pyqt6
 ```
 
+> **透明说明（Windows）：** `transparent=True` 由 Qt RHI DirectComposition 表面
+> 实现，需要 **PySide6**（唯一暴露 `QRhi` 的绑定）且系统为 **Windows 8+**。在
+> PyQt6 / PyQt5 / PySide2 下库仍可正常导入运行，但宿主会退化为**不透明**背景并
+> 打印一条警告日志。macOS 不受影响。
+
 ## 🧑‍💻 使用示例
 
 ### 基础用法
