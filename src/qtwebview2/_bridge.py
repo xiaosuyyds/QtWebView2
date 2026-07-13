@@ -37,8 +37,7 @@ class QtWebView2ApiBridge(QtWebViewSignals):
 # JS API bridge protocol & default implementation
 # ═══════════════════════════════════════════════════════════════════════════════
 
-JSONSerializable = Union[dict[str, "JSONSerializable"], list["JSONSerializable"],
-str, int, float, bool, None]
+JSONSerializable = Union[dict[str, "JSONSerializable"], list["JSONSerializable"], str, int, float, bool, None]
 
 
 @typing.runtime_checkable

@@ -391,7 +391,6 @@ class QtWebViewWidget(QWidget):
             )
             if data_dir:
                 data_dir = f"{data_dir}/QtWebView/"
-            logger.debug("[%s] WebView DataFolder: %s", self, data_dir)
             kwargs["data_directory"] = data_dir
         else:
             kwargs["data_directory"] = self._user_data_folder
@@ -680,7 +679,7 @@ class QtWebViewWidget(QWidget):
     def _teardown_webview(self):
         """Drop the webview cleanly"""
         if self._webview is not None:
-            logger.debug("[%s] teardown via aboutToQuit", self)
+            logger.debug("[%s] teardown", self)
             self._webview = None
         if self._anchor:
             self._anchor.deleteLater()

@@ -6,20 +6,61 @@
 ``_AnchorWindow`` — top-level transparent host for the WebView child HWND.
 
 On Windows the window is made layered (per-pixel alpha via
-``WS_EX_LAYERED``) so that resize events can fill newly-exposed pixels
-with alpha=1 — eliminating the black-edge flicker that the DWM would
-otherwise produce when the layered surface is extended during resize.
+``WS_EX_LAYERED``) to fill newly-exposed pixels with alpha=1 during
+resize — eliminating the black-edge flicker the DWM would otherwise
+produce when the layered surface is extended.
 
 See the class docstring for a detailed rationale.
 """
 from __future__ import annotations
 
-import logging
+import ctypes
 import sys
+from ctypes import wintypes
+
 from qtpy.QtCore import Qt, QTimer
 from qtpy.QtWidgets import QWidget
 
-_log = logging.getLogger(__name__)
+
+# ── ctypes structures ──
+class _BITMAPINFOHEADER(ctypes.Structure):
+    _fields_ = [
+        ("biSize", ctypes.c_uint32),
+        ("biWidth", ctypes.c_int32),
+        ("biHeight", ctypes.c_int32),
+        ("biPlanes", ctypes.c_uint16),
+        ("biBitCount", ctypes.c_uint16),
+        ("biCompression", ctypes.c_uint32),
+        ("biSizeImage", ctypes.c_uint32),
+        ("biXPelsPerMeter", ctypes.c_int32),
+        ("biYPelsPerMeter", ctypes.c_int32),
+        ("biClrUsed", ctypes.c_uint32),
+        ("biClrImportant", ctypes.c_uint32),
+    ]
+
+
+class _BLENDFUNCTION(ctypes.Structure):
+    _fields_ = [
+        ("BlendOp", ctypes.c_byte),
+        ("BlendFlags", ctypes.c_byte),
+        ("SourceConstantAlpha", ctypes.c_byte),
+        ("AlphaFormat", ctypes.c_byte),
+    ]
+
+
+class _POINT(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_int32), ("y", ctypes.c_int32)]
+
+
+class _SIZE(ctypes.Structure):
+    _fields_ = [("cx", ctypes.c_int32), ("cy", ctypes.c_int32)]
+
+
+_RECT = ctypes.c_uint32 * 4  # left, top, right, bottom
+
+# Pre-allocated constant structures
+_BLEND = _BLENDFUNCTION(0, 0, 255, 1)  # AC_SRC_OVER, use per-pixel alpha
+_ZERO_POINT = _POINT(0, 0)
 
 
 class _AnchorWindow(QWidget):
@@ -48,23 +89,19 @@ class _AnchorWindow(QWidget):
 
     2. ``nativeEvent`` catches ``WM_SIZE`` — during a resize the window's
        layered surface is extended by the DWM (new area = alpha=0).  We
-       immediately schedule (throttled) or directly call ``_fill_layered``
-       which submits a fresh 32-bit BGRA bitmap via the Win32
-       ``UpdateLayeredWindow`` API — bypassing Qt's paint machinery entirely.
+       schedule a deferred fill via a single-shot throttling timer at
+       ~20 fps (50 ms).  The timer is restarted on every ``WM_SIZE``,
+       so during an active resize gesture (60–120 WM_SIZE/sec) the fill
+       is deferred indefinitely — the layered surface is NOT updated
+       mid-resize.  This avoids DWM re-composition flicker from competing
+       with the resize itself.  ``WM_EXITSIZEMOVE`` (0x0232) triggers an
+       immediate fill for the final frame.
 
-    3. Throttling (~30 fps via ``_fill_timer``) — calling
-       ``UpdateLayeredWindow`` on every ``WM_SIZE`` (which fires 60–120
-       times/sec during a mouse drag) causes the DWM to re-composite the
-       entire window each time, making the WebView content flicker.
-       Throttling to ~30 fps reduces the flicker to an acceptable level
-       while still updating quickly enough that the resize feels responsive.
-       ``WM_EXITSIZEMOVE`` (0x0232) triggers an immediate final update.
+    3. A periodic 500 ms refresh timer runs whenever the window is visible
+       as a safety net for edge cases where a needed repaint is not
+       triggered by any window message (e.g. DWM composition events).
 
-    4. Cached DIB section — creating a new 32-bit bitmap on every call
-       is wasteful.  We cache the GDI objects and only recreate them when
-       the window grows beyond the cached size.
-
-    5. The bitmap is filled with BGRA ``(0, 0, 0, 1)`` — premultiplied
+    4. The bitmap is filled with BGRA ``(0, 0, 0, 1)`` — premultiplied
        alpha where every pixel has alpha=1.  The DWM does per-pixel
        hit-testing: alpha>0 means the pixel belongs to this window, so
        clicks are registered even though the pixel is visually transparent
@@ -92,8 +129,18 @@ class _AnchorWindow(QWidget):
         self._fill_timer = QTimer(self)
         self._fill_timer.setSingleShot(True)
         self._fill_timer.timeout.connect(self._fill_layered)
-        # Release GDI objects when the widget is destroyed
-        self.destroyed.connect(self._cleanup_gdi)
+        # Periodic refresh — safety net for missed/dropped repaint events
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.setInterval(500)
+        self._refresh_timer.timeout.connect(self._fill_layered)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._refresh_timer.start()
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        self._refresh_timer.stop()
 
     # ── Win32 message handling ──────────────────────────────────────────
 
@@ -103,20 +150,19 @@ class _AnchorWindow(QWidget):
         if eventType != b"windows_generic_MSG":
             return False, 0
 
-        import ctypes
-        from ctypes import wintypes
         msg = ctypes.cast(int(message), ctypes.POINTER(wintypes.MSG)).contents
 
         if msg.message == 0x0005:  # WM_SIZE
-            # Throttle: restart the 33 ms timer.  If the user keeps
+            # Throttle: restart the 50 ms timer.  If the user keeps
             # dragging, the timer never fires and we don't flood the
             # DWM with UpdateLayeredWindow calls.
-            self._fill_timer.start(33)
+            self._fill_timer.start(50)
         elif msg.message == 0x0232:  # WM_EXITSIZEMOVE
             # Resize gesture ended — stop the timer and paint immediately
             # so the final frame is guaranteed correct.
             self._fill_timer.stop()
             self._fill_layered()
+            self._fill_timer.start(50)
         elif msg.message == 0x031E:  # WM_DWMCOMPOSITIONCHANGED
             # DWM composition state changed (RDP connect/disconnect,
             # theme toggle, DWM restart).  The layered surface may
@@ -126,109 +172,52 @@ class _AnchorWindow(QWidget):
             # Re-show after hide: the DWM discards the layered surface
             # on hide.  The DWM runs in a separate process and processes
             # show commands asynchronously — there is no Win32 message
-            # that signals completion.  We reuse the existing 33 ms
+            # that signals completion.  We reuse the existing 50 ms
             # throttled fill timer (also used by WM_SIZE) to defer
             # UpdateLayeredWindow until the DWM has settled.
             if msg.wParam == 1:
-                self._fill_timer.start(33)
+                self._fill_timer.stop()
+                self._fill_layered()
+                self._fill_timer.start(50)
 
         return False, 0
 
     # ── Per-pixel alpha surface update ───────────────────────────────────
 
     def _fill_layered(self):
-        """Create (or reuse) a 32-bit BGRA DIB section, fill every pixel
+        """Create a 32-bit BGRA DIB section, fill every pixel
         with ``(B=0, G=0, R=0, A=1)``, and submit it via
         ``UpdateLayeredWindow`` with ``ULW_ALPHA``."""
-        import ctypes
-        from ctypes import wintypes
-
         hwnd = int(self.winId())
-        rect = wintypes.RECT()
-        ctypes.windll.user32.GetClientRect(hwnd, ctypes.byref(rect))
-        w, h = rect.right, rect.bottom
+        rect = _RECT()
+        ctypes.windll.user32.GetClientRect(hwnd, rect)
+        w, h = rect[2], rect[3]  # right, bottom
         if w <= 0 or h <= 0:
             return
 
-        # ── Cached 32-bit DIB section (recreate only when growing) ──
-        cache = getattr(self, '_ulw_cache', None)
-        if cache is None or cache['w'] < w or cache['h'] < h:
-            # Destroy previous cache if it exists
-            if cache:
-                ctypes.windll.gdi32.SelectObject(cache['dc'], cache['old'])
-                ctypes.windll.gdi32.DeleteObject(cache['bmp'])
-                ctypes.windll.gdi32.DeleteDC(cache['dc'])
-                ctypes.windll.user32.ReleaseDC(0, cache['scrdc'])
+        bih = _BITMAPINFOHEADER()
+        bih.biSize = ctypes.sizeof(_BITMAPINFOHEADER)
+        bih.biWidth = w
+        bih.biHeight = -h  # negative → top-down DIB (origin at top-left)
+        bih.biPlanes = 1
+        bih.biBitCount = 32  # BGRA, 8 bits per channel
 
-            class BITMAPINFOHEADER(ctypes.Structure):
-                _fields_ = [
-                    ("biSize", wintypes.DWORD), ("biWidth", wintypes.LONG),
-                    ("biHeight", wintypes.LONG), ("biPlanes", wintypes.WORD),
-                    ("biBitCount", wintypes.WORD), ("biCompression", wintypes.DWORD),
-                    ("biSizeImage", wintypes.DWORD), ("biXPelsPerMeter", wintypes.LONG),
-                    ("biYPelsPerMeter", wintypes.LONG), ("biClrUsed", wintypes.DWORD),
-                    ("biClrImportant", wintypes.DWORD),
-                ]
-
-            bih = BITMAPINFOHEADER()
-            bih.biSize = ctypes.sizeof(BITMAPINFOHEADER)
-            bih.biWidth = w
-            bih.biHeight = -h  # negative → top-down DIB (origin at top-left)
-            bih.biPlanes = 1
-            bih.biBitCount = 32  # BGRA, 8 bits per channel
-
-            scrdc = ctypes.windll.user32.GetDC(0)
-            mdc = ctypes.windll.gdi32.CreateCompatibleDC(scrdc)
-            pBits = ctypes.c_void_p()
-            hbmp = ctypes.windll.gdi32.CreateDIBSection(
-                mdc, ctypes.byref(bih), 0, ctypes.byref(pBits), None, 0)
-            old = ctypes.windll.gdi32.SelectObject(mdc, hbmp)
-            self._ulw_cache = dict(dc=mdc, bmp=hbmp, pBits=pBits,
-                                   old=old, scrdc=scrdc, w=w, h=h)
-        else:
-            mdc = cache['dc']
-            scrdc = cache['scrdc']
-            pBits = cache['pBits']
+        scrdc = ctypes.windll.user32.GetDC(0)
+        mdc = ctypes.windll.gdi32.CreateCompatibleDC(scrdc)
+        pBits = ctypes.c_void_p()
+        hbmp = ctypes.windll.gdi32.CreateDIBSection(
+            mdc, ctypes.byref(bih), 0, ctypes.byref(pBits), None, 0)
+        old_bmp = ctypes.windll.gdi32.SelectObject(mdc, hbmp)
 
         # Fill: premultiplied alpha BGRA (B=0, G=0, R=0, A=1).
-        # Uses Python bytes multiplication (C-level, no loop).
         ctypes.memmove(pBits, b'\x00\x00\x00\x01' * (w * h), w * h * 4)
 
-        # BLENDFUNCTION: AC_SRC_OVER + AC_SRC_ALPHA.
-        # SourceConstantAlpha=255 means "use per-pixel alpha as-is".
-        # Fields MUST be ctypes.c_byte (signed), not wintypes.BYTE.
-        class BLENDFUNCTION(ctypes.Structure):
-            _fields_ = [
-                ("BlendOp", ctypes.c_byte), ("BlendFlags", ctypes.c_byte),
-                ("SourceConstantAlpha", ctypes.c_byte), ("AlphaFormat", ctypes.c_byte),
-            ]
-
-        class POINT(ctypes.Structure):
-            _fields_ = [("x", wintypes.LONG), ("y", wintypes.LONG)]
-
-        class SIZE(ctypes.Structure):
-            _fields_ = [("cx", wintypes.LONG), ("cy", wintypes.LONG)]
-
-        blend = BLENDFUNCTION(0, 0, 255, 1)
-        # pptDst=NULL — keep the window at its current screen position
         ctypes.windll.user32.UpdateLayeredWindow(
-            hwnd, scrdc, None, ctypes.byref(SIZE(w, h)),
-            mdc, ctypes.byref(POINT(0, 0)),
-            0, ctypes.byref(blend), 0x00000002)  # 0x00000002 = ULW_ALPHA
+            hwnd, scrdc, None, ctypes.byref(_SIZE(w, h)),
+            mdc, ctypes.byref(_ZERO_POINT),
+            0, ctypes.byref(_BLEND), 0x00000002)  # 0x00000002 = ULW_ALPHA
 
-    # ── GDI cleanup ────────────────────────────────────────────────────────
-
-    def _cleanup_gdi(self):
-        """Release cached GDI objects (Screen DC, Memory DC, DIB Section).
-
-        Connected to :meth:`QObject.destroyed` so the resources are freed
-        even when the widget is closed via ``deleteLater()``."""
-        cache = getattr(self, '_ulw_cache', None)
-        if cache is None:
-            return
-        import ctypes
-        ctypes.windll.gdi32.SelectObject(cache['dc'], cache['old'])
-        ctypes.windll.gdi32.DeleteObject(cache['bmp'])
-        ctypes.windll.gdi32.DeleteDC(cache['dc'])
-        ctypes.windll.user32.ReleaseDC(0, cache['scrdc'])
-        self._ulw_cache = None
+        ctypes.windll.gdi32.SelectObject(mdc, old_bmp)
+        ctypes.windll.gdi32.DeleteObject(hbmp)
+        ctypes.windll.user32.ReleaseDC(0, scrdc)
+        ctypes.windll.gdi32.DeleteDC(mdc)
